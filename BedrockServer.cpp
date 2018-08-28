@@ -7,6 +7,7 @@
 
 set<string>BedrockServer::_blacklistedParallelCommands;
 recursive_mutex BedrockServer::_blacklistedParallelCommandMutex;
+recursive_mutex BedrockServer::_commandPortMutex;
 
 void BedrockServer::acceptCommand(SQLiteCommand&& command, bool isNew) {
     // If the sync node tells us that a command causes a crash, we immediately save that.
@@ -1244,8 +1245,8 @@ void BedrockServer::postPoll(fd_map& fdm, uint64_t& nextActivity) {
     }
     if (!_suppressCommandPort && (state == SQLiteNode::MASTERING || state == SQLiteNode::SLAVING) &&
         _shutdownState.load() == RUNNING) {
-        // Open the port
-        if (!_commandPort) {
+        // Open the port if we don't have one and we are the only thread trying to open it.
+        if (!_commandPort && _commandPortMutex.try_lock()) {
             SINFO("Ready to process commands, opening command port on '" << _args["-serverHost"] << "'");
             _commandPort = openPort(_args["-serverHost"]);
         }
@@ -1593,6 +1594,18 @@ void BedrockServer::suppressCommandPort(const string& reason, bool suppress, boo
     } else {
         // Clearing past suppression, but don't reopen (It's always safe to close, but not always safe to open).
         SHMMM("Clearing command port suppression");
+<<<<<<< HEAD
+=======
+        closures = _commandPortClosures.fetch_sub(1);
+        if (closures == 1 && _commandPortMutex.try_lock()) {
+            SINFO("Removing a command port closure.");
+            _commandPort = openPort(_args["-serverHost"]);
+        } else if (closures <= 0) {
+            SWARN("Trying to decrement command port closures past 0, incrementing it back.");
+            _commandPortClosures.fetch_add(1);
+        }
+
+>>>>>>> Add stack counter with mutex around opening the port
     }
 }
 
