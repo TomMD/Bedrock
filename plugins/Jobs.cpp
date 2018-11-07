@@ -652,9 +652,9 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
         string safeNumResults = SQ(max(request.calc("numResults"),1));
         bool mockRequest = command.request.isSet("mockRequest") || command.request.isSet("getMockedJobs");
         string selectQuery =
-            "SELECT jobID, name, data, parentJobID, retryAfter, created FROM ( "
+            "SELECT jobID, name, data, parentJobID, retryAfter, created, repeat FROM ( "
                 "SELECT * FROM ("
-                    "SELECT jobID, name, data, priority, parentJobID, retryAfter, created "
+                    "SELECT jobID, name, data, priority, parentJobID, retryAfter, created, repeat "
                     "FROM jobs "
                     "WHERE state IN ('QUEUED', 'RUNQUEUED') "
                         "AND priority=1000 "
@@ -665,7 +665,7 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
                 ") "
             "UNION ALL "
                 "SELECT * FROM ("
-                    "SELECT jobID, name, data, priority, parentJobID, retryAfter, created "
+                    "SELECT jobID, name, data, priority, parentJobID, retryAfter, created, repeat "
                     "FROM jobs "
                     "WHERE state IN ('QUEUED', 'RUNQUEUED') "
                         "AND priority=500 "
@@ -676,7 +676,7 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
                 ") "
             "UNION ALL "
                 "SELECT * FROM ("
-                    "SELECT jobID, name, data, priority, parentJobID, retryAfter, created "
+                    "SELECT jobID, name, data, priority, parentJobID, retryAfter, created, repeat "
                     "FROM jobs "
                     "WHERE state IN ('QUEUED', 'RUNQUEUED') "
                         "AND priority=0 "
@@ -711,7 +711,7 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
         list<STable> retriableJobs;
         list<string> jobList;
         for (size_t c=0; c<result.size(); ++c) {
-            SASSERT(result[c].size() == 6); // jobID, name, data, parentJobID, retryAfter, created
+            SASSERT(result[c].size() == 7); // jobID, name, data, parentJobID, retryAfter, created, repeat
 
             // Add this object to our output
             STable job;
@@ -731,6 +731,7 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
             // Add jobID to the respective list depending on if retryAfter is set
             if (result[c][4] != "") {
                 job["retryAfter"] = result[c][4];
+                job["repeat"] = result[c][6];
                 retriableJobs.push_back(job);
             } else {
                 nonRetriableJobs.push_back(result[c][0]);
@@ -784,7 +785,7 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
                 string updateQuery = "UPDATE jobs "
                                      "SET state='RUNQUEUED', "
                                          "lastRun=" + SCURRENT_TIMESTAMP() + ", "
-                                         "nextRun=DATETIME(" + SCURRENT_TIMESTAMP() + ", " + SQ(job["retryAfter"]) + ") "
+                                         "nextRun=MIN(DATETIME(" + SCURRENT_TIMESTAMP() + ", " + SQ(job["retryAfter"]) + "), " + _constructNextRunDATETIME(job["nextRun"], job["lastRun"], job["repeat"]) + ") "
                                      "WHERE jobID = " + SQ(job["jobID"]) + ";";
                 if (!db.writeIdempotent(updateQuery)) {
                     STHROW("502 Update failed");
