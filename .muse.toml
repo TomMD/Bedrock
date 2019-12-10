@@ -1,1 +1,2 @@
-build = "GXX=g++ CC=gcc make"
+build = "make"
+setup = ".muse.setup.sh"
