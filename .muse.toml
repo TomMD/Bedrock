@@ -1,2 +1,2 @@
-build = "make"
+build = "make bedrock"
 setup = ".muse.setup.sh"
