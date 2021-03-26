@@ -23,31 +23,49 @@ class BedrockCommand : public SQLiteCommand {
         QUEUE_SYNC,
     };
 
-    // used to create commands that don't count towards the total number of commands.
-    static constexpr int DONT_COUNT = 1;
+    enum class STAGE {
+        PEEK,
+        PROCESS
+    };
 
     // Times in *milliseconds*.
     static const uint64_t DEFAULT_TIMEOUT = 290'000; // 290 seconds, so clients can have a 5 minute timeout.
     static const uint64_t DEFAULT_TIMEOUT_FORGET = 60'000 * 60; // 1 hour for `connection: forget` commands.
     static const uint64_t DEFAULT_PROCESS_TIMEOUT = 30'000; // 30 seconds.
 
-    // Constructor to convert from an existing SQLiteCommand (by move).
-    BedrockCommand(SQLiteCommand&& from, int dontCount = 0);
-
-    // Move constructor.
-    BedrockCommand(BedrockCommand&& from);
-
     // Constructor to initialize via a request object (by move).
-    BedrockCommand(SData&& _request);
-
-    // Constructor to initialize via a request object (by copy).
-    BedrockCommand(SData _request);
+    BedrockCommand(SQLiteCommand&& baseCommand, BedrockPlugin* plugin, bool escalateImmediately_ = false);
 
     // Destructor.
-    ~BedrockCommand();
+    virtual ~BedrockCommand();
 
-    // Move assignment operator.
-    BedrockCommand& operator=(BedrockCommand&& from);
+    // Called to attempt to handle a command in a read-only fashion. Should return true if the command has been
+    // completely handled and a response has been written into `command.response`, which can be returned to the client.
+    // Should return `false` if the command needs to write to the database or otherwise could not be finished in a
+    // read-only fashion (i.e., it opened an HTTPS request and is waiting for the response).
+    virtual bool peek(SQLite& db) { STHROW("430 Unrecognized command"); }
+
+    // Called after a command has returned `false` to peek, and will attempt to commit and distribute a transaction
+    // with any changes to the DB made by this plugin.
+    virtual void process(SQLite& db) { STHROW("500 Base class process called"); }
+
+    // Reset the command after a commit conflict. This is called both before `peek` and `process`. Typically, we don't
+    // want to reset anything in `process`, because we may have specifically stored values there in `peek` that we want
+    // to access later. However, we provide this functionality to allow commands that make HTTPS requests to handle
+    // this extra case, as we run `peek` and `process` as separate transactions for these commands.
+    // The base class version of this does *not* change anything with regards to HTTPS requests. These are preserved
+    // across `reset` calls.
+    virtual void reset(STAGE stage);
+
+    // Return the name of the plugin for this command.
+    const string& getName() const;
+
+    // Bedrock will call this before each `processCommand` (note: not `peekCommand`) for each plugin to allow it to
+    // enable query rewriting. If a plugin would like to enable query rewriting, this should return true, and it should
+    // set the rewriteHandler it would like to use.
+    virtual bool shouldEnableQueryRewriting(const SQLite& db, bool (**rewriteHandler)(int, const char*, string&)) {
+        return false;
+    }
 
     // Start recording time for a given action type.
     void startTiming(TIMING_INFO type);
@@ -72,16 +90,26 @@ class BedrockCommand : public SQLiteCommand {
     int peekCount;
     int processCount;
 
-    // Keep track of who peeked and processed this command.
-    BedrockPlugin* peekedBy;
-    BedrockPlugin* processedBy;
+    // A plugin can optionally handle a command for which the reply to the caller was undeliverable.
+    // Note that it gets no reference to the DB, this happens after the transaction is already complete.
+    virtual void handleFailedReply() {
+        // Default implementation does nothing.
+    }
+
+    // Set to true if we don't want to log timeout alerts, and let the caller deal with it.
+    virtual bool shouldSuppressTimeoutWarnings() { return false; }
+
+    // A command can set this to true to indicate it would like to have `peek` called again after completing a HTTPS
+    // request. This allows a single command to make multiple serial HTTPS requests. The command should clear this when
+    // all HTTPS requests are complete. It will be automatically cleared if the command throws an exception.
+    bool repeek;
 
     // A list of timing sets, with an info type, start, and end.
     list<tuple<TIMING_INFO, uint64_t, uint64_t>> timingInfo;
 
-    // This defaults to false, but a specific plugin can set it to 'true' in peek() to force this command to be passed
+    // This defaults to false, but a specific plugin can set it to 'true' to force this command to be passed
     // to the sync thread for processing, thus guaranteeing that process() will not result in a conflict.
-    bool onlyProcessOnSyncThread;
+    virtual bool onlyProcessOnSyncThread() { return false; }
 
     // This is a set of name/value pairs that must be present and matching for two commands to compare as "equivalent"
     // for the sake of determining whether they're likely to cause a crash.
@@ -115,8 +143,19 @@ class BedrockCommand : public SQLiteCommand {
     // Return the timestamp by which this command must finish executing.
     uint64_t timeout() const { return _timeout; }
 
-    // Return the number of commands in existence that weren't created with DONT_COUNT.
+    // Return the number of commands in existence.
     static size_t getCommandCount() { return _commandCount.load(); }
+
+    // True if this command should be escalated immediately. This can be true for any command that does all of its work
+    // in `process` instead of peek, as it will always be escalated to leader 
+    const bool escalateImmediately;
+
+    // Record the state we were acting under in the last call to `peek` or `process`.
+    SQLiteNode::State lastPeekedOrProcessedInState = SQLiteNode::UNKNOWN;
+
+  protected:
+    // The plugin that owns this command.
+    BedrockPlugin* _plugin;
 
   private:
     // Set certain initial state on construction. Common functionality to several constructors.
@@ -133,5 +172,5 @@ class BedrockCommand : public SQLiteCommand {
 
     static atomic<size_t> _commandCount;
 
-    bool countCommand;
+    static const string defaultPluginName;
 };

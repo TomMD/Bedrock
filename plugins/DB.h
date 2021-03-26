@@ -1,15 +1,21 @@
+#pragma once
 #include <libstuff/libstuff.h>
 #include "../BedrockPlugin.h"
 
-// Declare the class we're going to implement below
 class BedrockPlugin_DB : public BedrockPlugin {
   public:
-    virtual string getName() { return "DB"; }
-    virtual void initialize(const SData& args, BedrockServer& server) { _args = args; }
-    virtual bool peekCommand(SQLite& db, BedrockCommand& command);
-    virtual bool processCommand(SQLite& db, BedrockCommand& command);
+    BedrockPlugin_DB(BedrockServer& s);
+    virtual const string& getName() const;
+    virtual unique_ptr<BedrockCommand> getCommand(SQLiteCommand&& baseCommand);
+    static const string name;
+};
+
+class BedrockDBCommand : public BedrockCommand {
+  public:
+    BedrockDBCommand(SQLiteCommand&& baseCommand, BedrockPlugin_DB* plugin);
+    virtual bool peek(SQLite& db);
+    virtual void process(SQLite& db);
 
   private:
-    // Attributes
-    SData _args;
+    const string query;
 };

@@ -1,16 +1,16 @@
 # Set the compiler, if it's not set by the environment.
 ifndef GXX
-	GXX = g++-6
+	GXX = g++-9
 endif
 
 ifndef CC
-	CC = gcc-6
+	CC = gcc-9
 endif
 
 GIT_REVISION = $(shell git rev-parse --short HEAD)
 PROJECT = $(shell git rev-parse --show-toplevel)
 INCLUDE = -I$(PROJECT) -I$(PROJECT)/mbedtls/include
-CXXFLAGS = -g -std=c++14 -fpic -O2 -Wall -Werror -Wformat-security -DGIT_REVISION=$(GIT_REVISION) $(INCLUDE)
+CXXFLAGS = -g -std=c++17 -fpic -O2 $(BEDROCK_OPTIM_COMPILE_FLAG) -Wall -Werror -Wformat-security -DGIT_REVISION=$(GIT_REVISION) $(INCLUDE)
 LDFLAGS +=-Wl,-Bsymbolic-functions -Wl,-z,relro
 
 # We'll stick object and dependency files in here so we don't need to look at them.
@@ -33,7 +33,7 @@ testplugin:
 PRECOMPILE_D =libstuff/libstuff.d
 PRECOMPILE_INCLUDE =-include libstuff/libstuff.h
 libstuff/libstuff.h.gch libstuff/libstuff.d: libstuff/libstuff.h mbedtls/library/libmbedcrypto.a
-	$(GXX) $(CXXFLAGS) -MMD -MF libstuff/libstuff.d -MT libstuff/libstuff.h.gch -c libstuff/libstuff.h
+	$(GXX) $(CXXFLAGS) -MD -MF libstuff/libstuff.d -MT libstuff/libstuff.h.gch -c libstuff/libstuff.h
 ifneq ($(MAKECMDGOALS),clean)
 -include  libstuff/libstuff.d
 endif
@@ -47,14 +47,16 @@ clean:
 	rm -rf test/clustertest/clustertest
 	rm -rf libstuff/libstuff.d
 	rm -rf libstuff/libstuff.h.gch
-	cd mbedtls && $(MAKE) clean
+	# If we've never run `make`, `mbedtls/Makefile` does not exist. Add a `test
+	# -f` check and `|| true` so it doesn't cause `make clean` to exit nonzero
+	(test -f mbedtls/Makefile && cd mbedtls && $(MAKE) clean) || true
 	cd test/clustertest/testplugin && $(MAKE) clean
 
 # The mbedtls libraries are all built the same way.
 mbedtls/library/libmbedcrypto.a mbedtls/library/libmbedtls.a mbedtls/library/libmbedx509.a:
 	git submodule init
 	git submodule update
-	cd mbedtls && git checkout -q c49b808ae490f03d665df5faae457f613aa31aaf
+	cd mbedtls && git checkout -q 04a049bda1ceca48060b57bc4bcf5203ce591421
 	cd mbedtls && $(MAKE) no_test && touch library/libmbedcrypto.a && touch library/libmbedtls.a && touch library/libmbedx509.a
 
 # Ok, that's the end of our magic PCH code. The only other mention of it is in the build line where we include it.
@@ -78,18 +80,9 @@ TESTOBJ = $(TESTCPP:%.cpp=$(INTERMEDIATEDIR)/%.o)
 TESTDEP = $(TESTCPP:%.cpp=$(INTERMEDIATEDIR)/%.d)
 
 CLUSTERTESTCPP = $(shell find test -name '*.cpp' -not -path 'test/tests*' -not -path "test/main.cpp")
+CLUSTERTESTCPP += test/tests/jobs/JobTestHelper.cpp
 CLUSTERTESTOBJ = $(CLUSTERTESTCPP:%.cpp=$(INTERMEDIATEDIR)/%.o)
 CLUSTERTESTDEP = $(CLUSTERTESTCPP:%.cpp=$(INTERMEDIATEDIR)/%.d)
-
-# Bring in the dependency files. This will cause them to be created if necessary. This is skipped if we're cleaning, as
-# they'll just get deleted anyway.
-ifneq ($(MAKECMDGOALS),clean)
--include $(STUFFDEP)
--include $(LIBBEDROCKDEP)
--include $(BEDROCKDEP)
-#-include $(TESTDEP)
-#-include $(CLUSTERTESTDEP)
-endif
 
 # Our static libraries just depend on their object files.
 libstuff.a: $(STUFFOBJ)
@@ -99,7 +92,7 @@ libbedrock.a: $(LIBBEDROCKOBJ)
 
 # We use the same library paths and required libraries for both binaries.
 LIBPATHS =-Lmbedtls/library -L$(PROJECT)
-LIBRARIES =-lbedrock -lstuff -ldl -lpcrecpp -lpthread -lmbedtls -lmbedx509 -lmbedcrypto -lz
+LIBRARIES =-lbedrock -lstuff -lbedrock -ldl -lpcrecpp -lpthread -lmbedtls -lmbedx509 -lmbedcrypto -lz
 
 # The prerequisites for both binaries are the same. We only include one of the mbedtls libs to avoid building three
 # times in parallel.
@@ -120,15 +113,25 @@ test/clustertest/clustertest: $(CLUSTERTESTOBJ) $(BINPREREQS)
 # where for the object file rule, the reverse is true.
 $(INTERMEDIATEDIR)/%.d: %.cpp $(PRECOMPILE_D)
 	@mkdir -p $(dir $@)
-	$(GXX) $(CXXFLAGS) -MMD -MF $@ $(PRECOMPILE_INCLUDE) -o $(INTERMEDIATEDIR)/$*.o -c $<
+	$(GXX) $(CXXFLAGS) -MD -MF $@ $(PRECOMPILE_INCLUDE) -o $(INTERMEDIATEDIR)/$*.o -c $<
 
 # .o files depend on .d files to prevent simultaneous jobs from trying to create both.
 $(INTERMEDIATEDIR)/%.o: %.cpp $(INTERMEDIATEDIR)/%.d
 	@mkdir -p $(dir $@)
-	$(GXX) $(CXXFLAGS) -MMD -MF $(INTERMEDIATEDIR)/$*.d $(PRECOMPILE_INCLUDE) -o $@ -c $<
+	$(GXX) $(CXXFLAGS) -MD -MF $(INTERMEDIATEDIR)/$*.d $(PRECOMPILE_INCLUDE) -o $@ -c $<
 
 # Build c files. This is basically just for sqlite, so we don't bother with dependencies for it.
 # SQLITE_MAX_MMAP_SIZE is set to 16TB.
 $(INTERMEDIATEDIR)/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) -O2 -Wno-unused-but-set-variable -DSQLITE_ENABLE_STAT4 -DSQLITE_ENABLE_JSON1 -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_UPDATE_DELETE_LIMIT -DSQLITE_ENABLE_NOOP_UPDATE -DSQLITE_MUTEX_ALERT_MILLISECONDS=20 -DHAVE_USLEEP=1 -DSQLITE_MAX_MMAP_SIZE=17592186044416ull -DSQLITE_SHARED_MAPPING -DSQLITE_ENABLE_NORMALIZE -o $@ -c $<
+	$(CC) -O2 $(BEDROCK_OPTIM_COMPILE_FLAG) -Wno-unused-but-set-variable -DSQLITE_ENABLE_STAT4 -DSQLITE_ENABLE_JSON1 -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_UPDATE_DELETE_LIMIT -DSQLITE_ENABLE_NOOP_UPDATE -DSQLITE_MUTEX_ALERT_MILLISECONDS=20 -DHAVE_USLEEP=1 -DSQLITE_MAX_MMAP_SIZE=17592186044416ull -DSQLITE_SHARED_MAPPING -DSQLITE_ENABLE_NORMALIZE -o $@ -c $<
+
+# Bring in the dependency files. This will cause them to be created if necessary. This is skipped if we're cleaning, as
+# they'll just get deleted anyway.
+ifneq ($(MAKECMDGOALS),clean)
+-include $(STUFFDEP)
+-include $(LIBBEDROCKDEP)
+-include $(BEDROCKDEP)
+#-include $(TESTDEP)
+#-include $(CLUSTERTESTDEP)
+endif

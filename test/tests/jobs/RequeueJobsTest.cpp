@@ -9,12 +9,13 @@ struct RequeueJobsTest : tpunit::TestFixture {
                               TEST(RequeueJobsTest::requeueRunqueuedJob),
                               TEST(RequeueJobsTest::requeueMultipleJobs),
                               TEST(RequeueJobsTest::changeMultipleJobNames),
+                              TEST(RequeueJobsTest::testNextRunTime),
                               AFTER(RequeueJobsTest::tearDown),
                               AFTER_CLASS(RequeueJobsTest::tearDownClass)) { }
 
     BedrockTester* tester;
 
-    void setupClass() { tester = new BedrockTester(_threadID, {{"-plugins", "Jobs,DB"}}, {});}
+    void setupClass() { tester = new BedrockTester({{"-plugins", "Jobs,DB"}}, {});}
 
     // Reset the jobs table
     void tearDown() {
@@ -195,4 +196,31 @@ struct RequeueJobsTest : tpunit::TestFixture {
         ASSERT_EQUAL(result[0][0], "QUEUED");
         ASSERT_EQUAL(result[0][1], "newJobName");
     }
+
+    void testNextRunTime() {
+        // Some time setup
+        const uint64_t time = STimeNow();
+        string oldTime = SComposeTime("%Y-%m-%d %H:%M:%S", time - 10'000'000);
+        string currentTime = SComposeTime("%Y-%m-%d %H:%M:%S", time + 10'000'000);
+
+        // Create the job we will requeue
+        SData command("CreateJob");
+        command["name"] = "job";
+        command["nextRun"] = currentTime;
+        command["created"] = oldTime;
+        STable response = tester->executeWaitVerifyContentTable(command);
+        string jobID = response["jobID"];
+
+        // Requeue the job
+        command.clear();
+        command.methodLine = "RequeueJobs";
+        command["jobIDs"] = jobID;
+        tester->executeWaitVerifyContent(command);
+
+        // Verify that nextRun = created
+        SQResult result;
+        tester->readDB("SELECT created, nextRun FROM jobs WHERE jobID = " + jobID + ";",  result);
+        ASSERT_EQUAL(result[0][0], result[0][1]);
+    }
+
 } __RequeueJobsTest;

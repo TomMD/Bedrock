@@ -4,6 +4,11 @@
 #undef SLOGPREFIX
 #define SLOGPREFIX "{" << getName() << "} "
 
+const string BedrockPlugin_MySQL::name("MySQL");
+const string& BedrockPlugin_MySQL::getName() const {
+    return name;
+}
+
 MySQLPacket::MySQLPacket() {
     // Initialize
     sequenceID = 0;
@@ -19,9 +24,9 @@ string MySQLPacket::serialize() {
     return header + payload;
 }
 
-int MySQLPacket::deserialize(const string& packet) {
+int MySQLPacket::deserialize(const char* packet, const size_t size) {
     // Does it have a header?
-    if (packet.size() < 4) {
+    if (size < 4) {
         return 0;
     }
 
@@ -30,12 +35,12 @@ int MySQLPacket::deserialize(const string& packet) {
     sequenceID = (uint8_t)packet[3];
 
     // Do we have enough data for the full payload?
-    if (packet.size() < (4 + payloadLength)) {
+    if (size < (4 + payloadLength)) {
         return 0;
     }
 
     // Have the full payload, parse it out
-    payload = packet.substr(4, payloadLength);
+    payload = string(packet + 4, payloadLength);
 
     // Indicate that we've consumed this full packet
     return 4 + payloadLength;
@@ -78,11 +83,11 @@ string MySQLPacket::serializeHandshake() {
     // Just hard code the values for now
     MySQLPacket handshake;
     handshake.payload += lenEncInt(10);      // protocol version
-    handshake.payload += (string) "5.0.0"; // server version
+    handshake.payload += "5.0.0"s; // server version
     handshake.payload += lenEncInt(0);       // NULL
     uint32_t connectionID = 1;
     SAppend(handshake.payload, &connectionID, 4); // connection_id
-    handshake.payload += (string) "xxxxxxxx";     // auth_plugin_data_part_1
+    handshake.payload += "xxxxxxxx"s;     // auth_plugin_data_part_1
     handshake.payload += lenEncInt(0);            // filler
 
     uint32_t CLIENT_LONG_PASSWORD = 0x00000001;
@@ -102,20 +107,18 @@ string MySQLPacket::serializeHandshake() {
 
     SAppend(handshake.payload, &capability_flags_2, 2); // capability_flags_2 (high 2 bytes)
 
-    // Random challenge bytes client expects for mysql_native_password authentication.
-    // Hardcoded for now as proper authentication is not yet supported by Bedrock.
-    // Specific bytes are taken from example handshake packed provided by Oracle:
+    // The first byte is the length of the auth_plugin_name string. Followed by 10 NULL
+    // characters for the "reserved" field. Since we don't support CLIENT_SECURE_CONNECTION 
+    // in our capabilities we can skip auth-plugin-data-part-2
     // https://dev.mysql.com/doc/internals/en/client-wants-native-server-wants-old.html
     // (Initial Handshake Packet)
     uint8_t auth_plugin_data[] = {
         0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x40, 0x42, 0x68, 0x66, 0x48,
-        0x74, 0x2f, 0x2d, 0x34, 0x5e, 0x5a, 0x2c, 0x00 };
+        0x00, 0x00, 0x00 };
 
     SAppend(handshake.payload, auth_plugin_data, sizeof(auth_plugin_data));
 
-    handshake.payload += (string) "mysql_native_password"; // auth_plugin_name
-    handshake.payload += lenEncInt(0);                     // filler
+    handshake.payload += "mysql_native_password"s; // auth_plugin_name
 
     return handshake.serialize();
 }
@@ -222,6 +225,14 @@ string MySQLPacket::serializeERR(int sequenceID, uint16_t code, const string& me
     return err.serialize();
 }
 
+BedrockPlugin_MySQL::BedrockPlugin_MySQL(BedrockServer& s) : BedrockPlugin_DB(s)
+{
+}
+
+string BedrockPlugin_MySQL::getPort() {
+    return server.args.isSet("-mysql.host") ? server.args["-mysql.host"] : "localhost:3306";
+}
+
 void BedrockPlugin_MySQL::onPortAccept(STCPManager::Socket* s) {
     // Send Protocol::HandshakeV10
     SINFO("Accepted MySQL request from '" << s->addr << "'");
@@ -232,10 +243,10 @@ void BedrockPlugin_MySQL::onPortRecv(STCPManager::Socket* s, SData& request) {
     // Get any new MySQL requests
     int packetSize = 0;
     MySQLPacket packet;
-    while ((packetSize = packet.deserialize(s->recvBuffer))) {
+    while ((packetSize = packet.deserialize(s->recvBuffer.c_str(), s->recvBuffer.size()))) {
         // Got a packet, process it
         SDEBUG("Received command #" << (int)packet.sequenceID << ": '" << SToHex(packet.serialize()) << "'");
-        SConsumeFront(s->recvBuffer, packetSize);
+        s->recvBuffer.consumeFront(packetSize);
         switch (packet.payload[0]) {
         case 3: { // COM_QUERY
             // Decode the query

@@ -145,20 +145,41 @@ class BedrockServer : public SQLiteServer {
         DONE
     };
 
-    // This is the list of plugins that we're actually using, which is a subset of all available plugins. It will be
-    // initialized at construction based on the arguments passed in.
-    list<BedrockPlugin*> plugins;
+    // All of our available plugins, indexed by the name they supply.
+    map<string, BedrockPlugin*> plugins;
 
-    // Our only constructor.
-    BedrockServer(const SData& args);
+    // Our primary constructor.
+    BedrockServer(const SData& args_);
+
+    // A constructor that builds an object that does nothing. This exists only to pass to stubbed-out test methods that
+    // require a BedrockServer object.
+    BedrockServer(SQLiteNode::State state, const SData& args_);
 
     // Destructor
     virtual ~BedrockServer();
+
+    // Create a ScopedStateSnapshot to force `getState` to return a snapshot at the current node state for the current
+    // thread until the object goes out of scope.
+    class ScopedStateSnapshot {
+      public:
+        ScopedStateSnapshot(const BedrockServer& owner) : _owner(owner) {
+            _nodeStateSnapshot.store(owner._replicationState);
+        }
+        ~ScopedStateSnapshot() {
+            _nodeStateSnapshot.store(SQLiteNode::UNKNOWN);
+        }
+
+      private:
+        const BedrockServer& _owner;
+    };
 
     // Accept an incoming command from an SQLiteNode.
     // `isNew` will be set to true if this command has never been seen before, and false if this is an existing command
     // being returned to the command queue (such as one that was previously escalated).
     // SQLiteNode API.
+    void acceptCommand(unique_ptr<SQLiteCommand>&& command, bool isNew = true);
+
+    // Backwards-compatible version of the above method for plugins that already used it.
     void acceptCommand(SQLiteCommand&& command, bool isNew = true);
 
     // Cancel a command.
@@ -176,8 +197,10 @@ class BedrockServer : public SQLiteServer {
     // Returns true when everything's ready to shutdown.
     bool shutdownComplete();
 
-    // Exposes the replication state to plugins.
-    SQLiteNode::State getState() const { return _replicationState.load(); }
+    // Exposes the replication state to plugins. Note that this is guaranteed not to change inside a call to
+    // `peekCommand` or `processCommand`, but this is only from the command's point-of-view - the underlying value can
+    // change at any time.
+    const atomic<SQLiteNode::State>& getState() const;
 
     // When a peer node logs in, we'll send it our crash command list.
     void onNodeLogin(SQLiteNode::Peer* peer);
@@ -193,8 +216,8 @@ class BedrockServer : public SQLiteServer {
     // Returns whether or not this server was configured to backup.
     bool shouldBackup();
 
-    // Returns a copy of the internal state of the sync node's peers. This can be empty if there are no peers, or no
-    // sync node.
+    // Returns a representation of the internal state of the sync node's peers. This can be empty if there are no
+    // peers, or no sync node.
     list<STable> getPeerInfo();
 
     // Send a command to all of our peers. It will be wrapped appropriately.
@@ -207,17 +230,22 @@ class BedrockServer : public SQLiteServer {
     // Returns if we are detached and the sync thread has exited.
     bool isDetached();
 
+    // See if there's a plugin that can turn this request into a command.
+    // If not, we'll create a command that returns `430 Unrecognized command`.
+    unique_ptr<BedrockCommand> getCommandFromPlugins(SData&& request);
+    unique_ptr<BedrockCommand> getCommandFromPlugins(unique_ptr<SQLiteCommand>&& baseCommand);
+
     // If you want to exit from the detached state, set this to true and the server will exit after the next loop.
     // It has no effect when not detached (except that it will cause the server to exit immediately upon becoming
     // detached), and shouldn't need to be reset, because the server exits immediately upon seeing this.
     atomic<bool> shutdownWhileDetached;
 
+    // Arguments passed on the command line.
+    const SData args;
+
   private:
     // The name of the sync thread.
     static constexpr auto _syncThreadName = "sync";
-
-    // Arguments passed on the command line. This is modified internally and used as a general attribute store.
-    SData _args;
 
     // Commands that aren't currently being processed are kept here.
     BedrockCommandQueue _commandQueue;
@@ -286,38 +314,33 @@ class BedrockServer : public SQLiteServer {
 
     // This is the function that launches the sync thread, which will bring up the SQLiteNode for this server, and then
     // start the worker threads.
-    static void sync(SData& args,
+    static void sync(const SData& args,
                      atomic<SQLiteNode::State>& replicationState,
-                     atomic<bool>& upgradeInProgress,
                      atomic<string>& leaderVersion,
                      BedrockTimeoutCommandQueue& syncNodeQueuedCommands,
                      BedrockServer& server);
 
     // Wraps the sync thread main function to make it easy to add exception handling.
-    static void syncWrapper(SData& args,
+    static void syncWrapper(const SData& args,
                      atomic<SQLiteNode::State>& replicationState,
-                     atomic<bool>& upgradeInProgress,
                      atomic<string>& leaderVersion,
                      BedrockTimeoutCommandQueue& syncNodeQueuedCommands,
                      BedrockServer& server);
 
     // Each worker thread runs this function. It gets the same data as the sync thread, plus its individual thread ID.
-    static void worker(SData& args,
+    static void worker(SQLitePool& dbPool,
                        atomic<SQLiteNode::State>& _replicationState,
-                       atomic<bool>& upgradeInProgress,
                        atomic<string>& leaderVersion,
                        BedrockTimeoutCommandQueue& syncNodeQueuedCommands,
                        BedrockTimeoutCommandQueue& syncNodeCompletedCommands,
                        BedrockServer& server,
-                       int threadId,
-                       int threadCount);
+                       int threadId);
 
     // Send a reply for a completed command back to the initiating client. If the `originator` of the command is set,
     // then this is an error, as the command should have been sent back to a peer.
-    void _reply(BedrockCommand&);
+    void _reply(unique_ptr<BedrockCommand>& command);
 
     // The following are constants used as methodlines by status command requests.
-    static constexpr auto STATUS_IS_SLAVE          = "GET /status/isSlave HTTP/1.1";
     static constexpr auto STATUS_IS_FOLLOWER       = "GET /status/isFollower HTTP/1.1";
     static constexpr auto STATUS_HANDLING_COMMANDS = "GET /status/handlingCommands HTTP/1.1";
     static constexpr auto STATUS_PING              = "Ping";
@@ -332,14 +355,12 @@ class BedrockServer : public SQLiteServer {
     // object.
     shared_ptr<SQLiteNode> _syncNode;
 
-    // Because status will access internal sync node data, we lock in both places that will access the pointer above.
-    recursive_timed_mutex _syncMutex;
-
     // Functions for checking for and responding to status and control commands.
-    bool _isStatusCommand(BedrockCommand& command);
-    void _status(BedrockCommand& command);
-    bool _isControlCommand(BedrockCommand& command);
-    void _control(BedrockCommand& command);
+    bool _isStatusCommand(const unique_ptr<BedrockCommand>& command);
+    void _status(unique_ptr<BedrockCommand>& command);
+    bool _isControlCommand(const unique_ptr<BedrockCommand>& command);
+    bool _isNonSecureControlCommand(const unique_ptr<BedrockCommand>& command);
+    void _control(unique_ptr<BedrockCommand>& command);
 
     // Accepts any sockets pending on our listening ports. We do this both after `poll()`, and before shutting down
     // those ports.
@@ -352,20 +373,11 @@ class BedrockServer : public SQLiteServer {
     // depends on a future commit if we're a follower that's behind leader, and a client makes two requests, one to a node
     // more current than ourselves, and a following request to us. We'll move these commands to this special map until
     // we catch up, and then move them back to the regular command queue.
-    multimap<uint64_t, BedrockCommand> _futureCommitCommands;
+    multimap<uint64_t, unique_ptr<BedrockCommand>> _futureCommitCommands;
 
     // Map of command timeouts to the indexes into _futureCommitCommands where those commands live.
     multimap<uint64_t, uint64_t> _futureCommitCommandTimeouts;
     recursive_mutex _futureCommitCommandMutex;
-
-    // This is a shared mutex. It can be locked by many readers at once, but if the writer (the sync thread) locks it,
-    // no other thread can access it. It's locked by the sync thread immediately before starting a transaction, and
-    // unlocked afterward. Workers do the same, so that they won't try to start a new transaction while the sync thread
-    // is committing. This mutex is *not* recursive.
-    shared_timed_mutex _syncThreadCommitMutex;
-
-    // Set this when we switch leading.
-    atomic<bool> _suppressMultiWrite;
 
     // A set of command names that will always be run with QUORUM consistency level.
     // Specified by the `-synchronousCommands` command-line switch.
@@ -404,6 +416,10 @@ class BedrockServer : public SQLiteServer {
     // commands ordered such that the first ones to time out are at the front.
     struct compareCommandByTimeout {
         bool operator() (BedrockCommand* a, BedrockCommand* b) const {
+            if (a->timeout() == b->timeout()) {
+                // Tiebreaker so that two commands with the same timeout don't appear equivalent.
+                return a < b;
+            }
             return a->timeout() < b->timeout();
         }
     };
@@ -414,14 +430,14 @@ class BedrockServer : public SQLiteServer {
 
     // Takes a command that has an outstanding HTTPS request and saves it in _outstandingHTTPSCommands until its HTTPS
     // requests are complete.
-    void waitForHTTPS(BedrockCommand&& command);
+    void waitForHTTPS(unique_ptr<BedrockCommand>&& command);
 
     // Takes a list of completed HTTPS requests, and move those commands back to the main queue (as long as they don't
     // have any other incomplete requests).
     int finishWaitingForHTTPS(list<SHTTPSManager::Transaction*>& completedHTTPSRequests);
 
     // Send a reply to a command that was escalated to us from a peer, rather than a locally-connected client.
-    void _finishPeerCommand(BedrockCommand& command);
+    void _finishPeerCommand(unique_ptr<BedrockCommand>& command);
 
     // When we're standing down, we temporarily dump newly received commands here (this lets all existing
     // partially-completed commands, like commands with HTTPS requests) finish without risking getting caught in an
@@ -443,15 +459,13 @@ class BedrockServer : public SQLiteServer {
 
     // Returns whether or not the command was a status or control command. If it was, it will have already been handled
     // and responded to upon return
-    bool _handleIfStatusOrControlCommand(BedrockCommand& command);
+    bool _handleIfStatusOrControlCommand(unique_ptr<BedrockCommand>& command);
 
     // Check a command against the list of crash commands, and return whether we think the command would crash.
-    bool _wouldCrash(const BedrockCommand& command);
+    bool _wouldCrash(const unique_ptr<BedrockCommand>& command);
 
     // Generate a CRASH_COMMAND command for a given bad command.
-    static SData _generateCrashMessage(const BedrockCommand* command);
-
-    static void _addRequestID(SData& request);
+    static SData _generateCrashMessage(const unique_ptr<BedrockCommand>& command);
 
     // The number of seconds to wait between forcing a command to QUORUM.
     uint64_t _quorumCheckpointSeconds;
@@ -462,4 +476,11 @@ class BedrockServer : public SQLiteServer {
     // We keep a queue of completed commands that workers will insert into when they've successfully finished a command
     // that just needs to be returned to a peer.
     BedrockTimeoutCommandQueue _completedCommands;
+
+    // Whether or not all plugins are detached
+    bool _pluginsDetached;
+
+    // This is a snapshot of the state of the node taken at the beginning of any call to peekCommand or processCommand
+    // so that the state can't change for the lifetime of that call, from the view of that function.
+    static thread_local atomic<SQLiteNode::State> _nodeStateSnapshot;
 };

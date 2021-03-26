@@ -19,7 +19,7 @@ class TestServer : public SQLiteServer {
   public:
     TestServer(const string& host) : SQLiteServer(host) { }
 
-    virtual void acceptCommand(SQLiteCommand&& command, bool isNew) { }
+    virtual void acceptCommand(unique_ptr<SQLiteCommand>&& command, bool isNew) { }
     virtual void cancelCommand(const string& commandID) { }
     virtual bool canStandDown() { return true; }
     virtual void onNodeLogin(SQLiteNode::Peer* peer) { }
@@ -31,7 +31,8 @@ struct SQLiteNodeTest : tpunit::TestFixture {
                                            TEST(SQLiteNodeTest::testFindSyncPeer)) { }
 
     // Filename for temp DB.
-    char filename[17] = "br_sync_dbXXXXXX";
+    char filenameTemplate[17] = "br_sync_dbXXXXXX";
+    char filename[17];
 
     void teardown() {
         unlink(filename);
@@ -40,24 +41,20 @@ struct SQLiteNodeTest : tpunit::TestFixture {
     void testFindSyncPeer() {
 
         // This exposes just enough to test the peer selection logic.
+        strcpy(filename, filenameTemplate);
         int fd = mkstemp(filename);
         close(fd);
-        SQLite db(filename, 1000000, 100, 5000, -1, -1);
+        SQLitePool dbPool(10, filename, 1000000, 5000, 0);
         TestServer server("");
-        SQLiteNode testNode(server, db, "test", "localhost:19998", "", 1, 1000000000, "1.0");
-
-        STable dummyParams;
-        testNode.addPeer("peer1", "host1.fake:15555", dummyParams);
-        testNode.addPeer("peer2", "host2.fake:16666", dummyParams);
-        testNode.addPeer("peer3", "host3.fake:17777", dummyParams);
-        testNode.addPeer("peer4", "host4.fake:18888", dummyParams);
+        string peerList = "host1.fake:15555?nodeName=peer1,host2.fake:16666?nodeName=peer2,host3.fake:17777?nodeName=peer3,host4.fake:18888?nodeName=peer4";
+        SQLiteNode testNode(server, dbPool, "test", "localhost:19998", peerList, 1, 1000000000, "1.0");
 
         // Do a base test, with one peer with no latency.
         SQLiteNode::Peer* fastest = nullptr;
         for (auto peer : testNode.peerList) {
             int peerNum = peer->name[4] - 48;
-            (*peer)["LoggedIn"] = "true";
-            (*peer)["CommitCount"] = to_string(10000000 + peerNum);
+            peer->loggedIn = true;
+            peer->setCommit(10000000 + peerNum, "");
 
             // 0, 100, 200, 300.
             peer->latency = (peerNum - 1) * 100;
@@ -84,7 +81,7 @@ struct SQLiteNodeTest : tpunit::TestFixture {
         // And see what happens if our fastest peer logs out.
         for (auto peer : testNode.peerList) {
             if (peer->name == "peer3") {
-                (*peer)["LoggedIn"] = "false";
+                peer->loggedIn = false;
                 peer->latency = 50;
             }
 

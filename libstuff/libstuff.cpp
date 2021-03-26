@@ -62,7 +62,40 @@
 thread_local string SThreadLogPrefix;
 thread_local string SThreadLogName;
 
+// We store the process name passed in `SInitialize` to use in logging.
+thread_local string SProcessName;
+
+// This is a set of reusable sockets, each with an associated mutex, to allow for parallel logging directly to the
+// syslog socket, rather than going through the syslog() system call, which goes through journald.
+const size_t S_LOG_SOCKET_MAX = 500;
+int SLogSocketFD[S_LOG_SOCKET_MAX] = {};
+mutex SLogSocketMutex[S_LOG_SOCKET_MAX];
+atomic<size_t> SLogSocketCurrentOffset(0);
+struct sockaddr_un SLogSocketAddr;
+atomic_flag SLogSocketsInitialized = ATOMIC_FLAG_INIT;
+
+// Set to `syslog` or `SSyslogSocketDirect`.
+atomic<void (*)(int priority, const char *format, ...)> SSyslogFunc = &syslog;
+
 void SInitialize(string threadName, const char* processName) {
+    // This is not really thread safe. It's guaranteed to run only once, because of the atomic flag, but it's not
+    // guaranteed that a second caller to `SInitialize` will wait until this block has completed before attempting to
+    // use the socket logging variables. This is handled by the fact that we call `SInitialize` in main() which waits
+    // for the completion of the call before any other threads can be initialized.
+    if (!SLogSocketsInitialized.test_and_set()) {
+        SLogSocketAddr.sun_family = AF_UNIX;
+        strcpy(SLogSocketAddr.sun_path, "/run/systemd/journal/syslog");
+        for (size_t i = 0; i < S_LOG_SOCKET_MAX; i++) {
+            SLogSocketFD[i] = -1;
+        }
+    }
+
+    // We statically store whichever process name was passed most recently to reuse. This lets new threads start up
+    // with the same process name as existing threads, even when using socket logging, since "openlog" has no effect
+    // then.
+    static string initialProcessName = processName ? processName : "bedrock";
+    SProcessName = initialProcessName;
+
     // If a specific process name has been supplied, initialize syslog with it.
     if (processName) {
         openlog(processName, 0, 0);
@@ -101,30 +134,95 @@ const char* SException::what() const noexcept {
     return method.c_str();
 }
 
-vector<string> SException::details() const noexcept {
+vector<string> SGetCallstack(int depth, void* const* callstack) noexcept {
     // Symbols for each stack frame.
     char** symbols = nullptr;
-    if (_depth) {
-        symbols = backtrace_symbols(_callstack, _depth);
-    }
-    vector<string> details(_depth + 1);
-    details[0] = string("Initially thrown from: ") + basename((char*)_file.c_str()) + ":" + to_string(_line);
+    symbols = backtrace_symbols(callstack, depth);
+
+    vector<string> details(depth + 1);
     int status = 0;
-    for (int i = 0; i < _depth; i++) {
+    for (int i = 0; i < depth; i++) {
         // Demangle them if possible.
         string temp = symbols[i];
         size_t start = temp.find_first_of('(');
         size_t end = temp.find_first_of('+', start);
         temp = temp.substr(start + 1, end - start - 1);
         char* demangled = abi::__cxa_demangle(temp.c_str(), 0, 0, &status);
+
+        // If the status is OK, we'll see if we can pull the address from the original string.
+        // If so, we concatenate that on the end of the demangled line. If we can't pull it out, we'll fall back to the
+        // original line, as we'd rather have mangled names with potential offsets than demangled names but lost
+        // offsets.
         if (status == 0) {
-            details[i + 1] = demangled;
+            string symbolsStr = string(symbols[i]);
+            size_t addressOffset = symbolsStr.find_last_of('[');
+            if (addressOffset != string::npos) {
+                details[i + 1] = string(demangled) + " " + symbolsStr.substr(addressOffset);
+            } else {
+                details[i + 1] = symbols[i];
+            }
         } else {
             details[i + 1] = symbols[i];
         }
         free(demangled);
     }
     return details;
+}
+
+vector<string> SException::details() const noexcept {
+    vector<string> stack = SGetCallstack(_depth, _callstack);
+    stack.push_back(string("Initially thrown from: ") + basename((char*)_file.c_str()) + ":" + to_string(_line));
+    return stack;
+}
+
+void SSyslogSocketDirect(int priority, const char *format, ...) {
+    int socketError = 0;
+    static const size_t MAX_MESSAGE_SIZE = 8 * 1024;
+
+    // Choose an FD from our array.
+    size_t socketIndex = (++SLogSocketCurrentOffset) % S_LOG_SOCKET_MAX;
+
+    // Lock for this particular socket. If more than one thread want to log using the same FD, some will wait.
+    lock_guard<mutex> lock(SLogSocketMutex[socketIndex]);
+
+    if (SLogSocketFD[socketIndex] == -1) {
+        // Create a socket if there isn't one already.
+        SLogSocketFD[socketIndex] = socket(AF_UNIX, SOCK_DGRAM, 0);
+    }
+    if (SLogSocketFD[socketIndex] == -1) {
+        // Error opening the socket. We'll fall back to regular syslog.
+        socketError = errno;
+    } else {
+        // At this point, the socket should be good.
+
+        // This is based on the message format here: https://tools.ietf.org/html/rfc5424#section-6 but doesn't actually
+        // match the format there, as it seems syslog ignores almost the entire "header" and "structured data" fields
+        // and treats them as part of the message.
+        string messageHeader = "<" + to_string(8 + priority) + ">" + SProcessName + ": ";
+        thread_local char messageBuffer[MAX_MESSAGE_SIZE];
+        strcpy(messageBuffer, messageHeader.c_str());
+        va_list argptr;
+        va_start(argptr, format);
+        int bytesWritten = vsnprintf(messageBuffer + messageHeader.size(), MAX_MESSAGE_SIZE - messageHeader.size(), format, argptr);
+        va_end(argptr);
+
+
+        // Assume we send the whole message. We don't do anything to handle message truncation.
+        ssize_t bytesSent = sendto(SLogSocketFD[socketIndex], messageBuffer, bytesWritten + messageHeader.size(), 0, (const struct sockaddr *)&SLogSocketAddr, sizeof(struct sockaddr_un));
+        if (bytesSent == -1) {
+            socketError = errno;
+            close(SLogSocketFD[socketIndex]);
+            SLogSocketFD[socketIndex] = -1;
+        }
+    }
+
+    if (socketError) {
+        syslog(LOG_WARNING, "Could not use direct logging socket (error: %i, %s), falling back to syslog syscall.", socketError, strerror(socketError));
+        va_list argptr;
+        va_start(argptr, format);
+        vsyslog(priority, format, argptr);
+        va_end(argptr);
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -236,13 +334,15 @@ bool SIContains(const string& lhs, const string& rhs) {
     return SContains(SToLower(lhs), SToLower(rhs));
 }
 
-bool SStartsWith(const string& haystack, const string& needle)
-{
-    if (needle.size() > haystack.size()) {
+bool SStartsWith(const string& haystack, const string& needle) {
+    return SStartsWith(haystack.c_str(), haystack.size(), needle.c_str(), needle.size());
+}
+
+bool SStartsWith(const char* haystack, size_t haystackSize, const char* needle, size_t needleSize) {
+    if (haystackSize < needleSize) {
         return false;
     }
-
-    return strncmp(haystack.c_str(), needle.c_str(), needle.size()) == 0;
+    return strncmp(haystack, needle, needleSize) == 0;
 }
 
 // --------------------------------------------------------------------------
@@ -562,25 +662,6 @@ bool SParseList(const char* ptr, list<string>& valueList, char separator) {
 
     // Return if we were able to find anything
     return (!component.empty());
-}
-
-// --------------------------------------------------------------------------
-void SConsumeFront(string& lhs, ssize_t num) {
-    SASSERT((int)lhs.size() >= num);
-    // If nothing, early out
-    if (!num)
-        return;
-
-    // If we're clearing the whole thing, early out
-    if ((int)lhs.size() == num) {
-        // Clear and done
-        lhs.clear();
-        return;
-    }
-
-    // Otherwise, move the end forward and resize
-    memmove(&lhs[0], &lhs[num], (int)lhs.size() - num);
-    lhs.resize((int)lhs.size() - num);
 }
 
 // --------------------------------------------------------------------------
@@ -1088,7 +1169,7 @@ string SComposePOST(const STable& nameValueMap) {
         }
     }
     string outStr = out.str();
-    SConsumeBack(outStr, 1); // Trim off trailing '&'
+    outStr.resize(outStr.size() - 1); // Trim off trailing '&'
     return outStr;
 }
 
@@ -1174,8 +1255,13 @@ extern const char* _SParseJSONValue(const char* ptr, const char* end, string& va
 
 string SToJSON(const string& value, const bool forceString) {
     // Is it an integer?
-    if (SToStr(SToInt64(value.c_str())) == value)
+    if (SToStr(SToInt64(value.c_str())) == value) {
         return value;
+    }
+    // Is it a float?
+    if (SToStr(SToFloat(value.c_str())) == value) {
+        return value;
+    }
 
     // Is it boolean?
     if (SIEquals(value, "true"))
@@ -1839,8 +1925,8 @@ bool SCheckNetworkErrorType(const string& logPrefix, const string& peer, int err
         // And these aren't interesting enough to say anything about at all (and aren't fatal).
         case S_EINTR:
         case S_EINPROGRESS:
-        case S_EWOULDBLOCK:
         case S_ESHUTDOWN:
+        case S_EWOULDBLOCK: // Same as S_EAGAIN in some distros (including Ubuntu)
             return true; // Socket still alive
     }
 }
@@ -1848,11 +1934,22 @@ bool SCheckNetworkErrorType(const string& logPrefix, const string& peer, int err
 // --------------------------------------------------------------------------
 // Receives data from a socket and appends to a string.  Returns 'true' if
 // the socket is still alive when done.
-bool S_recvappend(int s, string& recvBuffer) {
+bool S_recvappend(int s, SFastBuffer& recvBuffer) {
     SASSERT(s);
     // Figure out if this socket is blocking or non-blocking
     int flags = fcntl(s, F_GETFL);
     bool blocking = !(flags & O_NONBLOCK);
+
+    // Log size of the buffer before we read from it.
+    int bytesInBuffer = 0;
+    int ret = 0;
+    ret = ioctl(s, FIONREAD, &bytesInBuffer);
+
+    if (ret < 0) {
+        SHMMM("Unable to get length of socket buffer error: " << strerror(S_errno));
+    } else {
+        SINFO("[performance] " << bytesInBuffer << " bytes in the socket buffer before receiving.");
+    }
 
     // Keep trying to receive as long as we can
     char buffer[4096];
@@ -1866,8 +1963,9 @@ bool S_recvappend(int s, string& recvBuffer) {
         totalRecv += numRecv;
 
         // If this is a blocking socket, don't try again, once is enough
-        if (blocking)
+        if (blocking) {
             return true; // We're still alive
+        }
     }
 
     // See how we finished
@@ -1881,14 +1979,15 @@ bool S_recvappend(int s, string& recvBuffer) {
 }
 
 // --------------------------------------------------------------------------
-bool S_sendconsume(int s, string& sendBuffer) {
+bool S_sendconsume(int s, SFastBuffer& sendBuffer) {
     SASSERT(s);
     // If empty, nothing to do
     if (sendBuffer.empty()) {
         return true; // Assume no error, still alive
     }
 
-    if (SStartsWith(sendBuffer, "ESCALATE_RESPONSE")) {
+    // 17 is size of "ESCALATE_RESPONSE".
+    if (SStartsWith(sendBuffer.c_str(), sendBuffer.size(), "ESCALATE_RESPONSE", 17)) {
         SData tempData;
         tempData.deserialize(sendBuffer);
         string id = tempData["id"];
@@ -1899,21 +1998,28 @@ bool S_sendconsume(int s, string& sendBuffer) {
     chrono::steady_clock::time_point start = chrono::steady_clock::now();
 
     // Send as much as we can
-    ssize_t numSent = send(s, sendBuffer.c_str(), (int)sendBuffer.size(), MSG_NOSIGNAL);
+    ssize_t numSent = send(s, sendBuffer.c_str(), sendBuffer.size(), MSG_NOSIGNAL);
     string errorMessage;
     if (numSent == -1) {
         errorMessage = " Error: "s + strerror(errno);
     }
     SINFO("[performance] Send() took " << chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - start).count()
-        << " ms and sent " << numSent << " of " << (int)sendBuffer.size() << " bytes." << errorMessage);
+        << " ms and sent " << numSent << " of " << sendBuffer.size() << " bytes." << errorMessage);
 
     if (numSent > 0) {
-        SConsumeFront(sendBuffer, numSent);
+        sendBuffer.consumeFront(numSent);
     }
 
-    // Exit of no error
+    // Exit if no error
     if (numSent >= 0) {
         return true; // No error; still alive
+    }
+
+    // If we failed to send with over 1GB in the buffer, return false, even if the error would normally be non-fatal.
+    if (sendBuffer.size() > 1024 * 1024 * 1024) {
+        SWARN("send() failed with response '" << strerror(errno) << "' (#" << errno << "), and buffer size: "
+              << sendBuffer.size() << ", closing.");
+        return false;
     }
 
     // Error, what kind?
@@ -2429,22 +2535,30 @@ int SQuery(sqlite3* db, const char* e, const string& sql, SQResult& result, int6
     uint64_t elapsed = STimeNow() - startTime;
 
     // Warn if it took longer than the specified threshold
-    if ((int64_t)elapsed > warnThreshold)
-        SWARN("Slow query (" << elapsed / 1000 << "ms) " << sql.length() << ": " << sql.substr(0, 150));
+    string sqlToLog = sql;
+    if ((int64_t)elapsed > warnThreshold) {
+        // This code removing authTokens is a quick fix and should be removed once https://github.com/Expensify/Expensify/issues/144185 is done.
+        string match;
+        const bool hasAuthToken = SREMatch(".*(\"authToken\"\\:\"[0-9A-F]{400,1024}\").*", sql, match);
+        if (hasAuthToken) {
+            sqlToLog = SReplace(sql, match, "<REDACTED_AUTHTOKEN>");
+        }
+        SWARN("Slow query (" << elapsed / 1000 << "ms): " << sqlToLog);
+    }
 
     // Log this if enabled
     if (_g_sQueryLogFP) {
         // Log this query as an SQL statement ready for insertion
         const string& dbFilename = sqlite3_db_filename(db, "main");
         const string& csvRow =
-            "\"" + dbFilename + "\", " + "\"" + SEscape(STrim(sql), "\"", '"') + "\", " + SToStr(elapsed) + "\n";
+            "\"" + dbFilename + "\", " + "\"" + SEscape(STrim(sqlToLog), "\"", '"') + "\", " + SToStr(elapsed) + "\n";
         SASSERT(fwrite(csvRow.c_str(), 1, csvRow.size(), _g_sQueryLogFP) == csvRow.size());
     }
 
     // Only OK and commit conflicts are allowed without warning.
     if (error != SQLITE_OK && extErr != SQLITE_BUSY_SNAPSHOT) {
         if (!skipWarn) {
-            SWARN("'" << e << "', query failed with error #" << error << " (" << sqlite3_errmsg(db) << "): " << sql);
+            SWARN("'" << e << "', query failed with error #" << error << " (" << sqlite3_errmsg(db) << "): " << sqlToLog);
         }
     }
 
@@ -2487,7 +2601,8 @@ string SGetCurrentExceptionName()
     // exception name.
     int status = 0;
     size_t length = 1000;
-    char buffer[length] = {0};
+    char buffer[length];
+    memset(buffer, 0, length);
 
     // Demangle the name of the current exception.
     // See: https://libcxxabi.llvm.org/spec.html for details on this ABI interface.
@@ -2507,4 +2622,28 @@ void STerminateHandler(void) {
 
     // And we're out.
     abort();
+}
+
+bool SIsValidSQLiteDateModifier(const string& modifier) {
+    // See: https://www.sqlite.org/lang_datefunc.html
+    list<string> parts = SParseList(SToUpper(modifier));
+    for (const string& part : parts) {
+        // Simple regexp validation
+        if (SREMatch("^(\\+|-)\\d{1,3} (YEAR|MONTH|DAY|HOUR|MINUTE|SECOND)S?$", part)) {
+            continue;
+        }
+        if (SREMatch("^START OF (DAY|MONTH|YEAR)$", part)) {
+            continue;
+        }
+        if (SREMatch("^WEEKDAY [0-6]$", part)) {
+            continue;
+        }
+
+        // Couldn't match this part to any valid syntax
+        SINFO("Syntax error, failed parsing date modifier '" << modifier << "' on part '" << part << "'");
+        return false;
+    }
+
+    // Matched all parts, valid syntax
+    return true;
 }

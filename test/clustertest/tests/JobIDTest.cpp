@@ -2,7 +2,7 @@
 
 struct JobIDTest : tpunit::TestFixture {
     JobIDTest()
-        : tpunit::TestFixture("jobID",
+        : tpunit::TestFixture("JobID",
                               BEFORE_CLASS(JobIDTest::setup),
                               AFTER_CLASS(JobIDTest::teardown),
                               TEST(JobIDTest::test)
@@ -11,7 +11,7 @@ struct JobIDTest : tpunit::TestFixture {
     BedrockClusterTester* tester;
 
     void setup () {
-        tester = new BedrockClusterTester(_threadID);
+        tester = new BedrockClusterTester();
     }
 
     void teardown () {
@@ -20,13 +20,13 @@ struct JobIDTest : tpunit::TestFixture {
 
     void test()
     {
-        BedrockTester* leader = tester->getBedrockTester(0);
-        BedrockTester* follower = tester->getBedrockTester(1);
+        BedrockTester& leader = tester->getTester(0);
+        BedrockTester& follower = tester->getTester(1);
 
         // Create a job in leader
         SData createCmd("CreateJob");
         createCmd["name"] = "TestJob";
-        STable response = leader->executeWaitVerifyContentTable(createCmd);
+        STable response = leader.executeWaitVerifyContentTable(createCmd);
 
         // Restart follower. This is a regression test, before we only re-initialized the lastID if it was !=0 which made
         // these tests pass (because the first ID is 0) but fail in the real life. So here we make sure that when a follower
@@ -41,9 +41,9 @@ struct JobIDTest : tpunit::TestFixture {
         bool success = false;
         while (count++ < 50) {
             SData cmd("Status");
-            string response = follower->executeWaitVerifyContent(cmd);
+            string response = follower.executeWaitVerifyContent(cmd);
             STable json = SParseJSONObject(response);
-            if (json["state"] == "LEADING" || json["state"] == "MASTERING") {
+            if (json["isLeader"] == "true") {
                 success = true;
                 break;
             }
@@ -56,7 +56,7 @@ struct JobIDTest : tpunit::TestFixture {
         ASSERT_TRUE(success);
 
         // Create a job in the follower
-        response = follower->executeWaitVerifyContentTable(createCmd, "200");
+        response = follower.executeWaitVerifyContentTable(createCmd, "200");
 
         // Restart leader
         tester->startNode(0);
@@ -65,9 +65,9 @@ struct JobIDTest : tpunit::TestFixture {
         success = false;
         while (count++ < 50) {
             SData cmd("Status");
-            string response = leader->executeWaitVerifyContent(cmd);
+            string response = leader.executeWaitVerifyContent(cmd);
             STable json = SParseJSONObject(response);
-            if (json["state"] == "LEADING" || json["state"] == "MASTERING") {
+            if (json["isLeader"] == "true") {
                 success = true;
                 break;
             }
@@ -77,13 +77,13 @@ struct JobIDTest : tpunit::TestFixture {
         }
 
         // Create a new job in leader.
-        response = leader->executeWaitVerifyContentTable(createCmd);
+        response = leader.executeWaitVerifyContentTable(createCmd);
 
         // Get the 3 jobs to leave the db clean
         SData getCmd("GetJobs");
         getCmd["name"] = "*";
         getCmd["numResults"] = 3;
-        follower->executeWaitVerifyContentTable(getCmd, "200");
+        follower.executeWaitVerifyContentTable(getCmd, "200");
     }
 
 } __JobIDTest;

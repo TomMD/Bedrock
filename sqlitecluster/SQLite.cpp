@@ -3,14 +3,8 @@
 
 #define DBINFO(_MSG_) SINFO("{" << _filename << "} " << _MSG_)
 
-// Globally shared mutex for locking around commits and creating/destroying instances.
-recursive_mutex SQLite::_commitLock;
-
-// Global map for looking up shared data by file when creating new instances.
-map<string, SQLite::SharedData*> SQLite::_sharedDataLookupMap;
-
-// This is our only public static variable. It needs to be initialized after `_commitLock`.
-SLockTimer<recursive_mutex> SQLite::g_commitLock("Commit Lock", SQLite::_commitLock);
+atomic<int64_t> SQLite::_transactionAttemptCount(0);
+mutex SQLite::_pageLogMutex;
 
 atomic<int> SQLite::passiveCheckpointPageMin(2500); // Approx 10mb
 atomic<int> SQLite::fullCheckpointPageMin(25000); // Approx 100mb (pages are assumed to be 4kb)
@@ -18,121 +12,150 @@ atomic<int> SQLite::fullCheckpointPageMin(25000); // Approx 100mb (pages are ass
 // Tracing can only be enabled or disabled globally, not per object.
 atomic<bool> SQLite::enableTrace(false);
 
-SQLite::SQLite(const string& filename, int cacheSize, bool enableFullCheckpoints, int maxJournalSize, int journalTable,
-               int maxRequiredJournalTableID, const string& synchronous, int64_t mmapSizeGB) :
-    whitelist(nullptr),
-    _maxJournalSize(maxJournalSize),
-    _insideTransaction(false),
-    _beginElapsed(0),
-    _readElapsed(0),
-    _writeElapsed(0),
-    _prepareElapsed(0),
-    _commitElapsed(0),
-    _rollbackElapsed(0),
-    _enableRewrite(false),
-    _currentlyRunningRewritten(false),
-    _timeoutLimit(0),
-    _autoRolledBack(false),
-    _noopUpdateMode(false),
-    _enableFullCheckpoints(enableFullCheckpoints),
-    _queryCount(0),
-    _cacheHits(0),
-    _useCache(false),
-    _isDeterministicQuery(false)
-{
-    // Perform sanity checks.
-    SASSERT(!filename.empty());
-    SASSERT(cacheSize > 0);
-    SASSERT(maxJournalSize > 0);
-
+string SQLite::initializeFilename(const string& filename) {
     // Canonicalize our filename and save that version.
     if (filename == ":memory:") {
         // This path is special, it exists in memory. This doesn't actually work correctly with journaling and such, as
         // we'll act as if they're all referencing the same file when we're not. This should therefore only be used
         // with a single SQLite object.
-        _filename = filename;
+        return filename;
     } else {
         char resolvedPath[PATH_MAX];
         char* result = realpath(filename.c_str(), resolvedPath);
         if (!result) {
             SERROR("Couldn't resolve pathname for: " << filename);
         }
-        _filename = resolvedPath;
+        return resolvedPath;
     }
-    SINFO("Opening sqlite database: " << _filename);
+}
 
-    // Set our journal table name for this DB handle.
-    _journalName = _getJournalTableName(journalTable);
+SQLite::SharedData& SQLite::initializeSharedData(sqlite3* db, const string& filename, const vector<string>& journalNames) {
+    static map<string, SharedData*> sharedDataLookupMap;
+    static mutex instantiationMutex;
+    lock_guard<mutex> lock(instantiationMutex);
+    auto sharedDataIterator = sharedDataLookupMap.find(filename);
+    if (sharedDataIterator == sharedDataLookupMap.end()) {
+        SharedData* sharedData = new SharedData();
 
-    // We lock here To initialize the database. Because there's a global map of currently opened DB files, we lock
-    // whenever we might need to insert a new one. These are only ever added or changed in the constructor and
-    // destructor.
-    SQLITE_COMMIT_AUTOLOCK;
+        // Read the highest commit count from the database, and store it in commitCount.
+        string query = "SELECT MAX(maxIDs) FROM (" + _getJournalQuery(journalNames, {"SELECT MAX(id) as maxIDs FROM"}, true) + ")";
+        SQResult result;
+        SASSERT(!SQuery(db, "getting commit count", query, result));
+        uint64_t commitCount = result.empty() ? 0 : SToUInt64(result[0][0]);
+        sharedData->commitCount = commitCount;
 
-    // sqlite3_config can't run concurrently with *anything* else, so we make sure it's set not only on creating
-    // an entry, but on creating the *first* entry.
-    if(_sharedDataLookupMap.empty()) {
-        // Set the logging callback for sqlite errors.
-        sqlite3_config(SQLITE_CONFIG_LOG, _sqliteLogCallback, 0);
+        // And then read the hash for that transaction.
+        string lastCommittedHash, ignore;
+        getCommit(db, journalNames, commitCount, ignore, lastCommittedHash);
+        sharedData->lastCommittedHash.store(lastCommittedHash);
 
-        // Enable memory-mapped files.
-        if (mmapSizeGB) {
-            SINFO("Enabling Memory-Mapped I/O with " << mmapSizeGB << " GB.");
-            const int64_t GB = 1024 * 1024 * 1024;
-            sqlite3_config(SQLITE_CONFIG_MMAP_SIZE, mmapSizeGB * GB, 16 * 1024 * GB); // Max is 16TB
+        // If we have a commit count, we should have a hash as well.
+        if (commitCount && lastCommittedHash.empty()) {
+            SERROR("Loaded commit count " << commitCount << " with empty hash.");
         }
 
-        // Disable a mutex around `malloc`, which is *EXTREMELY IMPORTANT* for multi-threaded performance. Without this
-        // setting, all reads are essentially single-threaded as they'll all fight with each other for this mutex.
-        sqlite3_config(SQLITE_CONFIG_MEMSTATUS, 0);
-        sqlite3_initialize();
-        SASSERT(sqlite3_threadsafe());
-
-        // Disabled by default, but lets really beat it in. This way checkpointing does not need to wait on locks
-        // created in this thread.
-        SASSERT(sqlite3_enable_shared_cache(0) == SQLITE_OK);
-    }
-
-    // We're the initializer if we're the first one to add this entry to the map.
-    auto sharedDataIterator = _sharedDataLookupMap.find(_filename);
-    bool initializer = sharedDataIterator == _sharedDataLookupMap.end();
-    if (initializer) {
         // Insert our SharedData object into the global map.
-        _sharedData = new SharedData();
-        _sharedDataLookupMap.emplace(_filename, _sharedData);
+        sharedDataLookupMap.emplace(filename, sharedData);
+        return *sharedData;
     } else {
         // Otherwise, use the existing one.
-        _sharedData = sharedDataIterator->second;
+        return *(sharedDataIterator->second);
+    }
+}
+
+sqlite3* SQLite::initializeDB(const string& filename, int64_t mmapSizeGB) {
+    // Open the DB in read-write mode.
+    SINFO((SFileExists(filename) ? "Opening" : "Creating") << " database '" << filename << "'.");
+    sqlite3* db;
+    SASSERT(!sqlite3_open_v2(filename.c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX, NULL));
+
+    // PRAGMA legacy_file_format=OFF sets the default for creating new databases, so it must be called before creating
+    // any tables to be effective.
+    SASSERT(!SQuery(db, "new file format for DESC indexes", "PRAGMA legacy_file_format = OFF"));
+
+    return db;
+}
+
+vector<string> SQLite::initializeJournal(sqlite3* db, int minJournalTables) {
+    // Make sure we don't try and create more journals than we can name.
+    SASSERT(minJournalTables < 10'000);
+
+    // First, we create all of the tables through `minJournalTables` if they don't exist.
+    for (int currentJounalTable = -1; currentJounalTable <= minJournalTables; currentJounalTable++) {
+        char tableName[27] = {0};
+        if (currentJounalTable < 0) {
+            // The `-1` entry is just plain "journal".
+            snprintf(tableName, 27, "journal");
+        } else {
+            snprintf(tableName, 27, "journal%04i", currentJounalTable);
+        }
+        if (SQVerifyTable(db, tableName, "CREATE TABLE " + string(tableName) + " ( id INTEGER PRIMARY KEY, query TEXT, hash TEXT )")) {
+            SHMMM("Created " << tableName << " table.");
+        }
     }
 
-    // Insert ourself in the list of objects for our `SharedData`.
-    _sharedData->validObjects.insert(this);
+    // And we'll figure out which journal tables actually exist, which may be more than we require. They must be
+    // sequential.
+    int currentJounalTable = -1;
+    vector<string> journalNames;
+    while (true) {
+        char tableName[27] = {0};
+        if (currentJounalTable < 0) {
+            // The `-1` entry is just plain "journal".
+            snprintf(tableName, 27, "journal");
+        } else {
+            snprintf(tableName, 27, "journal%04i", currentJounalTable);
+        }
 
-    // Open the DB in read-write mode.
-    DBINFO((SFileExists(_filename) ? "Opening" : "Creating") << " database '" << _filename << "'.");
-    const int DB_WRITE_OPEN_FLAGS = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX;
-    SASSERT(!sqlite3_open_v2(filename.c_str(), &_db, DB_WRITE_OPEN_FLAGS, NULL));
+        if (SQVerifyTableExists(db, tableName)) {
+            journalNames.push_back(tableName);
+            currentJounalTable++;
+        } else {
+            break;
+        }
+    }
+    return journalNames;
+}
+
+uint64_t SQLite::initializeJournalSize(sqlite3* db, const vector<string>& journalNames) {
+    // We keep track of the number of rows in the journal, so that we can delete old entries when we're over our size
+    // limit.
+    // We want the min of all journal tables.
+    string minQuery = _getJournalQuery(journalNames, {"SELECT MIN(id) AS id FROM"}, true);
+    minQuery = "SELECT MIN(id) AS id FROM (" + minQuery + ")";
+
+    // And the max.
+    string maxQuery = _getJournalQuery(journalNames, {"SELECT MAX(id) AS id FROM"}, true);
+    maxQuery = "SELECT MAX(id) AS id FROM (" + maxQuery + ")";
+
+    // Look up the min and max values in the database.
+    SQResult result;
+    SASSERT(!SQuery(db, "getting commit min", minQuery, result));
+    uint64_t min = SToUInt64(result[0][0]);
+    SASSERT(!SQuery(db, "getting commit max", maxQuery, result));
+    uint64_t max = SToUInt64(result[0][0]);
+
+    // And save the difference as the size of the journal.
+    return max - min;
+}
+
+void SQLite::commonConstructorInitialization() {
+    // Perform sanity checks.
+    SASSERT(!_filename.empty());
+    SASSERT(_cacheSize > 0);
+    SASSERT(_maxJournalSize > 0);
+
+    // Turn on page logging if specified.
+    if (_pageLoggingEnabled) {
+        sqlite3_begin_concurrent_report_enable(_db, 1);
+    }
 
     // WAL is what allows simultaneous read/writing.
     SASSERT(!SQuery(_db, "enabling write ahead logging", "PRAGMA journal_mode = WAL;"));
 
-    if (mmapSizeGB) {
-        SASSERT(!SQuery(_db, "enabling memory-mapped I/O", "PRAGMA mmap_size=" + to_string(mmapSizeGB * 1024 * 1024 * 1024) + ";"));
+    if (_mmapSizeGB) {
+        SASSERT(!SQuery(_db, "enabling memory-mapped I/O", "PRAGMA mmap_size=" + to_string(_mmapSizeGB * 1024 * 1024 * 1024) + ";"));
     }
-
-    // PRAGMA legacy_file_format=OFF sets the default for creating new databases, so it must be called before creating
-    // any tables to be effective.
-    SASSERT(!SQuery(_db, "new file format for DESC indexes", "PRAGMA legacy_file_format = OFF"));
-
-    // Check if synchronous has been set and run query to use a custom synchronous setting
-    if (!synchronous.empty()) {
-        SASSERT(!SQuery(_db, "setting custom synchronous commits", "PRAGMA synchronous = " + SQ(synchronous)  + ";"));
-    } else {
-        DBINFO("Using SQLite default PRAGMA synchronous");
-    }
-
-    // These other pragmas only relate to read/write databases.
-    SASSERT(!SQuery(_db, "disabling change counting", "PRAGMA count_changes = OFF;"));
 
     // Do our own checkpointing.
     sqlite3_wal_hook(_db, _sqliteWALCallback, this);
@@ -141,68 +164,8 @@ SQLite::SQLite(const string& filename, int cacheSize, bool enableFullCheckpoints
     sqlite3_trace_v2(_db, SQLITE_TRACE_STMT, _sqliteTraceCallback, this);
 
     // Update the cache. -size means KB; +size means pages
-    SINFO("Setting cache_size to " << cacheSize << "KB");
-    SQuery(_db, "increasing cache size", "PRAGMA cache_size = -" + SQ(cacheSize) + ";");
-
-    // Now we (if we're the initializer) verify (and create if non-existent) all of our required journal tables.
-    if (initializer) {
-        for (int i = -1; i <= maxRequiredJournalTableID; i++) {
-            if (SQVerifyTable(_db, _getJournalTableName(i), "CREATE TABLE " + _getJournalTableName(i) +
-                              " ( id INTEGER PRIMARY KEY, query TEXT, hash TEXT )")) {
-                SHMMM("Created " << _getJournalTableName(i) << " table.");
-            }
-        }
-
-        // And we'll figure out which journal tables actually exist, which may be more than we require. They must be
-        // sequential.
-        int currentJounalTable = -1;
-        while(true) {
-            string name = _getJournalTableName(currentJounalTable);
-            if (SQVerifyTableExists(_db, name)) {
-                _sharedData->_journalNames.push_back(name);
-                currentJounalTable++;
-            } else {
-                break;
-            }
-        }
-    }
-
-    // We keep track of the number of rows in the journal, so that we can delete old entries when we're over our size
-    // limit.
-    // We want the min of all journal tables.
-    string minQuery = _getJournalQuery({"SELECT MIN(id) AS id FROM"}, true);
-    minQuery = "SELECT MIN(id) AS id FROM (" + minQuery + ")";
-
-    // And the max.
-    string maxQuery = _getJournalQuery({"SELECT MAX(id) AS id FROM"}, true);
-    maxQuery = "SELECT MAX(id) AS id FROM (" + maxQuery + ")";
-
-    // Look up the min and max values in the database.
-    SQResult result;
-    SASSERT(!SQuery(_db, "getting commit min", minQuery, result));
-    uint64_t min = SToUInt64(result[0][0]);
-    SASSERT(!SQuery(_db, "getting commit max", maxQuery, result));
-    uint64_t max = SToUInt64(result[0][0]);
-
-    // And save the difference as the size of the journal.
-    _journalSize = max - min;
-
-    // Now that the DB's all up and running, we can load our global data from it, if we're the initializer thread.
-    if (initializer) {
-        // Read the highest commit count from the database, and store it in _commitCount.
-        uint64_t commitCount = _getCommitCount();
-        _sharedData->_commitCount.store(commitCount);
-
-        // And then read the hash for that transaction.
-        string lastCommittedHash, ignore;
-        getCommit(commitCount, ignore, lastCommittedHash);
-        _sharedData->_lastCommittedHash.store(lastCommittedHash);
-
-        // If we have a commit count, we should have a hash as well.
-        if (commitCount && lastCommittedHash.empty()) {
-            SWARN("Loaded commit count " << commitCount << " with empty hash.");
-        }
-    }
+    SINFO("Setting cache_size to " << _cacheSize << "KB");
+    SQuery(_db, "increasing cache size", "PRAGMA cache_size = -" + SQ(_cacheSize) + ";");
 
     // Register the authorizer callback which allows callers to whitelist particular data in the DB.
     sqlite3_set_authorizer(_db, _sqliteAuthorizerCallback, this);
@@ -210,6 +173,46 @@ SQLite::SQLite(const string& filename, int cacheSize, bool enableFullCheckpoints
     // I tested and found that we could set about 10,000,000 and the number of steps to run and get a callback once a
     // second. This is set to be a bit more granular than that, which is probably adequate.
     sqlite3_progress_handler(_db, 1'000'000, _progressHandlerCallback, this);
+
+    // Check if synchronous has been set and run query to use a custom synchronous setting
+    if (!_synchronous.empty()) {
+        SASSERT(!SQuery(_db, "setting custom synchronous commits", "PRAGMA synchronous = " + SQ(_synchronous)  + ";"));
+    } else {
+        DBINFO("Using SQLite default PRAGMA synchronous");
+    }
+}
+
+SQLite::SQLite(const string& filename, int cacheSize, int maxJournalSize,
+               int minJournalTables, const string& synchronous, int64_t mmapSizeGB, bool pageLoggingEnabled) :
+    _filename(initializeFilename(filename)),
+    _maxJournalSize(maxJournalSize),
+    _db(initializeDB(_filename, mmapSizeGB)),
+    _journalNames(initializeJournal(_db, minJournalTables)),
+    _sharedData(initializeSharedData(_db, _filename, _journalNames)),
+    _journalName(_journalNames[0]),
+    _journalSize(initializeJournalSize(_db, _journalNames)),
+    _pageLoggingEnabled(pageLoggingEnabled),
+    _cacheSize(cacheSize),
+    _synchronous(synchronous),
+    _mmapSizeGB(mmapSizeGB)
+{
+    commonConstructorInitialization();
+}
+
+SQLite::SQLite(const SQLite& from) :
+    _filename(from._filename),
+    _maxJournalSize(from._maxJournalSize),
+    _db(initializeDB(_filename, from._mmapSizeGB)), // Create a *new* DB handle from the same filename, don't copy the existing handle.
+    _journalNames(from._journalNames),
+    _sharedData(from._sharedData),
+    _journalName(_journalNames[(_sharedData.nextJournalCount++ % _journalNames.size() - 1) + 1]),
+    _journalSize(from._journalSize),
+    _pageLoggingEnabled(from._pageLoggingEnabled),
+    _cacheSize(from._cacheSize),
+    _synchronous(from._synchronous),
+    _mmapSizeGB(from._mmapSizeGB)
+{
+    commonConstructorInitialization();
 }
 
 int SQLite::_progressHandlerCallback(void* arg) {
@@ -222,6 +225,14 @@ int SQLite::_progressHandlerCallback(void* arg) {
 
         // Return non-zero causes sqlite to interrupt the operation.
         return 1;
+    } else if (sqlite->_sharedData._checkpointThreadBusy.load()) {
+        if (sqlite->_enableCheckpointInterrupt) {
+            SINFO("[checkpoint] Abandoning transaction to unblock checkpoint");
+            sqlite->_abandonForCheckpoint = true;
+            return 2;
+        } else {
+            SHMMM("[checkpoint] Not unblocking transaction for checkpoint because _enableCheckpointInterrupt disabled.");
+        }
     }
     return 0;
 }
@@ -239,50 +250,43 @@ int SQLite::_sqliteTraceCallback(unsigned int traceCode, void* c, void* p, void*
 
 int SQLite::_sqliteWALCallback(void* data, sqlite3* db, const char* dbName, int pageCount) {
     SQLite* object = static_cast<SQLite*>(data);
-    object->_sharedData->_currentPageCount.store(pageCount);
+    object->_sharedData._currentPageCount.store(pageCount);
     // Try a passive checkpoint if full checkpoints aren't enabled, *or* if the page count is less than the required
     // size for a full checkpoint.
-    if (!object->_enableFullCheckpoints || pageCount < fullCheckpointPageMin.load()) {
-        int passive = passiveCheckpointPageMin.load();
-        if (!passive || pageCount < passive) {
-            SINFO("[checkpoint] skipping checkpoint with " << pageCount
-                  << " pages in WAL file (checkpoint every " << passive << " pages).");
-        } else {
-            int walSizeFrames = 0;
-            int framesCheckpointed = 0;
-            uint64_t start = STimeNow();
-            int result = sqlite3_wal_checkpoint_v2(db, dbName, SQLITE_CHECKPOINT_PASSIVE, &walSizeFrames, &framesCheckpointed);
-            SINFO("[checkpoint] passive checkpoint complete with " << pageCount
-                  << " pages in WAL file. Result: " << result << ". Total frames checkpointed: "
-                  << framesCheckpointed << " of " << walSizeFrames << " in " << ((STimeNow() - start) / 1000) << "ms.");
-        }
-    } else {
+    if (pageCount >= fullCheckpointPageMin.load()) {
         // If we get here, then full checkpoints are enabled, and we have enough pages in the WAL file to perform one.
         SINFO("[checkpoint] " << pageCount << " pages behind, beginning complete checkpoint.");
 
         // This thread will run independently. We capture the variables we need here and pass them by value.
         string filename = object->_filename;
         string dbNameCopy = dbName;
-        int alreadyCheckpointing = object->_sharedData->_checkpointThreadBusy.fetch_add(1);
+        int alreadyCheckpointing = object->_sharedData._checkpointThreadBusy.fetch_add(1);
         if (alreadyCheckpointing) {
             SINFO("[checkpoint] Not starting checkpoint thread. It's already running.");
             return SQLITE_OK;
         }
-        SDEBUG("[checkpoint] starting thread with count: " << object->_sharedData->_currentPageCount.load());
-        thread([object, filename, dbNameCopy]() {
+        SDEBUG("[checkpoint] starting thread with count: " << object->_sharedData._currentPageCount.load());
+
+        // We pass `destructorLock` into the thread to block the SQLite object's destructor from running while
+        // the checkpoint is still using that object. The lock is created in the parent thread, and then passed
+        // by move to the checkpoint thread, guaranteeing that there's no race here in returning from
+        // _sqliteWALCallback before we've acquired the lock. This does not protect in the opposite direction: if you
+        // destroy an SQLite while `_sqliteWALCallback` is running (i.e., inside a call to `SQLite::write()`, then
+        // things will still break.
+        thread([object, filename, dbNameCopy, destructorLock = unique_lock<mutex>(object->_destructorMutex)]() {
             SInitialize("checkpoint");
             uint64_t start = STimeNow();
 
             // Lock the mutex that keeps anyone from starting a new transaction.
-            lock_guard<decltype(object->_sharedData->blockNewTransactionsMutex)> transactionLock(object->_sharedData->blockNewTransactionsMutex);
+            unique_lock<decltype(object->_sharedData.blockNewTransactionsMutex)> transactionLock(object->_sharedData.blockNewTransactionsMutex);
 
             while (1) {
                 // Lock first, this prevents anyone from updating the count while we're operating here.
-                unique_lock<mutex> lock(object->_sharedData->notifyWaitMutex);
+                unique_lock<mutex> lock(object->_sharedData.notifyWaitMutex);
 
                 // Now that we have the lock, check the count. If there are no outstanding transactions, we can
                 // checkpoint immediately, and then we'll return.
-                int count = object->_sharedData->currentTransactionCount.load();
+                int count = object->_sharedData.currentTransactionCount.load();
 
                 // Lets re-check if we still need a full check point, it could be that a passive check point runs
                 // after we have started this loop and check points a large chunk or all of the pages we were trying
@@ -290,29 +294,16 @@ int SQLite::_sqliteWALCallback(void* data, sqlite3* db, const char* dbName, int 
                 // full check point for no reason. We wait for the page count to be less than half of the required amount
                 // to prevent bouncing off of this check every loop. If that's the case, just break out of the this loop
                 // and wait for the next full check point to be required.
-                int pageCount = object->_sharedData->_currentPageCount.load();
+                int pageCount = object->_sharedData._currentPageCount.load();
                 if (pageCount < (fullCheckpointPageMin.load() / 2)) {
                     SINFO("[checkpoint] Page count decreased below half the threshold, count is now " << pageCount << ", exiting full checkpoint loop.");
                     break;
                 } else {
                     SINFO("[checkpoint] Waiting on " << count << " remaining transactions.");
+                    object->_sharedData.checkpointRequired(*object);
                 }
 
                 if (count == 0) {
-                    // Grab the global commit lock. Then we can look up this object and see if it still exists.
-                    // This is safe to do, we know nobody's committing, since we just waited for all transactions
-                    // to be finished. Why this global lock? Because we re-used it for modifying SharedData
-                    // objects, because that's only done at creation/destruction of SQLite objects and here.
-                    SQLITE_COMMIT_AUTOLOCK;
-
-                    // Verify the SQLite object passed into this function still exists. It's feasible (though
-                    // unlikely), that it could have been deleted if we tried to run a checkpoint just before
-                    // shutting down (or otherwise destroying an SQLite object).
-                    auto it = _sharedDataLookupMap.find(filename);
-                    if (it == _sharedDataLookupMap.end() || it->second->validObjects.find(object) == it->second->validObjects.end()) {
-                        SWARN("Aborting checkpoint, SQLite object deleted.");
-                        break;
-                    }
 
                     // Time and run the checkpoint operation.
                     uint64_t checkpointStart = STimeNow();
@@ -326,55 +317,37 @@ int SQLite::_sqliteWALCallback(void* data, sqlite3* db, const char* dbName, int 
                           << " in " << ((STimeNow() - checkpointStart) / 1000) << "ms.");
 
                     // We're done. Anyone can start a new transaction.
+                    object->_sharedData.checkpointComplete(*object);
                     break;
                 }
 
                 // There are outstanding transactions (or we would have hit `break` above), so we'll wait until
                 // someone says the count has changed, and try again.
-                object->_sharedData->blockNewTransactionsCV.wait(lock);
+                object->_sharedData.blockNewTransactionsCV.wait(lock);
             }
 
             // Allow the next checkpointer.
-            object->_sharedData->_checkpointThreadBusy.store(0);
+            object->_sharedData._checkpointThreadBusy.store(0);
         }).detach();
     }
     return SQLITE_OK;
 }
 
 string SQLite::_getJournalQuery(const list<string>& queryParts, bool append) {
+    return _getJournalQuery(_journalNames, queryParts, append);
+}
+
+string SQLite::_getJournalQuery(const vector<string>& journalNames, const list<string>& queryParts, bool append) {
     list<string> queries;
-    for (const string& name : _sharedData->_journalNames) {
+    for (const string& name : journalNames) {
         queries.emplace_back(SComposeList(queryParts, " " + name + " ") + (append ? " " + name : ""));
     }
     string query = SComposeList(queries, " UNION ");
     return query;
 }
 
-string SQLite::_getJournalTableName(int journalTableID) {
-    if (journalTableID < 0) {
-        return "journal";
-    }
-    char buff[12] = {0};
-    sprintf(buff, "journal%04d", journalTableID);
-    return buff;
-}
-
 SQLite::~SQLite() {
-    // Lock around changes to the global shared list.
-    SINFO("Locking g_commitLock in destructor.");
-    SQLITE_COMMIT_AUTOLOCK;
-    SINFO("g_commitLock acquired in destructor.");
-
-    // Remove ourself from the list of valid objects.
-    _sharedData->validObjects.erase(this);
-
-    // If there are none left, remove the entire entry.
-    if (_sharedData->validObjects.size() == 0) {
-        auto it = _sharedDataLookupMap.find(_filename);
-        delete it->second;
-        _sharedDataLookupMap.erase(it);
-    }
-
+    lock_guard<mutex> lock(_destructorMutex);
     // Now we can clean up our own data.
     // First, rollback any incomplete transaction.
     if (!_uncommittedQuery.empty()) {
@@ -391,50 +364,40 @@ SQLite::~SQLite() {
 }
 
 void SQLite::waitForCheckpoint() {
-    lock_guard<mutex> lock(_sharedData->blockNewTransactionsMutex);
+    shared_lock<decltype(_sharedData.blockNewTransactionsMutex)> lock(_sharedData.blockNewTransactionsMutex);
 }
 
-bool SQLite::beginTransaction(bool useCache, const string& transactionName) {
+bool SQLite::beginTransaction(TRANSACTION_TYPE type) {
+    if (type == TRANSACTION_TYPE::EXCLUSIVE) {
+        _sharedData.commitLock.lock();
+        _sharedData._commitLockTimer.start("EXCLUSIVE");
+        _mutexLocked = true;
+    }
     SASSERT(!_insideTransaction);
     SASSERT(_uncommittedHash.empty());
     SASSERT(_uncommittedQuery.empty());
     {
-        unique_lock<mutex> lock(_sharedData->notifyWaitMutex);
-        _sharedData->currentTransactionCount++;
+        unique_lock<mutex> lock(_sharedData.notifyWaitMutex);
+        _sharedData.currentTransactionCount++;
     }
-    _sharedData->blockNewTransactionsCV.notify_one();
-    SDEBUG("Beginning transaction");
-    uint64_t before = STimeNow();
-    _insideTransaction = !SQuery(_db, "starting db transaction", "BEGIN TRANSACTION");
-    _queryCache.clear();
-    _transactionName = transactionName;
-    _useCache = useCache;
-    _queryCount = 0;
-    _cacheHits = 0;
-    _beginElapsed = STimeNow() - before;
-    _readElapsed = 0;
-    _writeElapsed = 0;
-    _prepareElapsed = 0;
-    _commitElapsed = 0;
-    _rollbackElapsed = 0;
-    return _insideTransaction;
-}
+    _sharedData.blockNewTransactionsCV.notify_one();
 
-bool SQLite::beginConcurrentTransaction(bool useCache, const string& transactionName) {
-    SASSERT(!_insideTransaction);
-    SASSERT(_uncommittedHash.empty());
-    SASSERT(_uncommittedQuery.empty());
-    {
-        unique_lock<mutex> lock(_sharedData->notifyWaitMutex);
-        _sharedData->currentTransactionCount++;
-    }
-    _sharedData->blockNewTransactionsCV.notify_one();
+    // Reset before the query, as it's possible the query sets these.
+    _abandonForCheckpoint = false;
+    _autoRolledBack = false;
+
     SDEBUG("[concurrent] Beginning transaction");
     uint64_t before = STimeNow();
+    _currentTransactionAttemptCount = -1;
     _insideTransaction = !SQuery(_db, "starting db transaction", "BEGIN CONCURRENT");
+
+    // Because some other thread could commit once we've run `BEGIN CONCURRENT`, this value can be slightly behind
+    // where we're actually able to start such that we know we shouldn't get a conflict if this commits successfully on
+    // leader. However, this is perfectly safe, it just adds the possibility that threads on followers wait for an
+    // extra transaction to complete before starting, which is an anti-optimization, but the alternative is wrapping
+    // the above `BEGIN CONCURRENT` and the `getCommitCount` call in a lock, which is worse.
+    _dbCountAtStart = getCommitCount();
     _queryCache.clear();
-    _transactionName = transactionName;
-    _useCache = useCache;
     _queryCount = 0;
     _cacheHits = 0;
     _beginElapsed = STimeNow() - before;
@@ -529,47 +492,64 @@ string SQLite::read(const string& query) {
 bool SQLite::read(const string& query, SQResult& result) {
     uint64_t before = STimeNow();
     _queryCount++;
-    if (_useCache) {
-        auto foundQuery = _queryCache.find(query);
-        if (foundQuery != _queryCache.end()) {
-            result = foundQuery->second;
-            _cacheHits++;
-            return true;
-        }
+    auto foundQuery = _queryCache.find(query);
+    if (foundQuery != _queryCache.end()) {
+        result = foundQuery->second;
+        _cacheHits++;
+        return true;
     }
     _isDeterministicQuery = true;
     bool queryResult = !SQuery(_db, "read only query", query, result);
-    if (_useCache && _isDeterministicQuery && queryResult) {
+    if (_isDeterministicQuery && queryResult) {
         _queryCache.emplace(make_pair(query, result));
     }
-    _checkTiming("timeout in SQLite::read"s);
+    _checkInterruptErrors("SQLite::read"s);
     _readElapsed += STimeNow() - before;
     return queryResult;
 }
 
-void SQLite::_checkTiming(const string& error) {
+void SQLite::_checkInterruptErrors(const string& error) {
+
+    // Local error code.
+    int errorCode = 0;
+    uint64_t time = 0;
+
+    // First check timeout. we want this to override the others, so we can't get stuck in an endless loop where we do
+    // something like throw `checkpoint_required_error` forever and never notice that the command has timed out.
     if (_timeoutLimit) {
         uint64_t now = STimeNow();
         if (now > _timeoutLimit) {
             _timeoutError = now - _timeoutStart;
         }
         if (_timeoutError) {
-            uint64_t time = _timeoutError;
+            time = _timeoutError;
             resetTiming();
-
-            // Timing out inside a write operation will automatically roll back the current transaction. We need to be
-            // aware as to whether or not this has happened.
-            // If autocommit is turned on, it means we're not inside an explicit `BEGIN` block, indicating that the
-            // transaction has been rolled back.
-            // see: http://www.sqlite.org/c3ref/get_autocommit.html
-            if (sqlite3_get_autocommit(_db)) {
-                SHMMM("It appears a write transaction timed out and automatically rolled back. Setting _autoRolledBack = true");
-                _autoRolledBack = true;
-            }
-
-            throw timeout_error(error, time);
+            errorCode = 1;
         }
     }
+
+    if (_abandonForCheckpoint) {
+        errorCode = 2;
+    }
+
+    // If we had an interrupt error, and were inside a transaction, and autocommit is now on, we have been auto-rolled
+    // back, we won't need to actually do a rollback for this transaction.
+    if (errorCode && _insideTransaction && sqlite3_get_autocommit(_db)) {
+        SHMMM("Transaction automatically rolled back. Setting _autoRolledBack = true");
+        _autoRolledBack = true;
+    }
+
+    // Reset this regardless of which error (or both) occurred. If we handled a timeout, this is still done, we don't
+    // need to abandon this later.
+    _abandonForCheckpoint = false;
+
+    if (errorCode == 1) {
+        throw timeout_error("timeout in "s + error, time);
+    } else if (errorCode == 2) {
+        throw checkpoint_required_error();
+    }
+
+    // Otherwise, no error.
 }
 
 bool SQLite::write(const string& query) {
@@ -606,26 +586,30 @@ bool SQLite::_writeIdempotent(const string& query, bool alwaysKeepQueries) {
 
     // Try to execute the query
     uint64_t before = STimeNow();
-    bool result = false;
     bool usedRewrittenQuery = false;
+    int resultCode = 0;
     if (_enableRewrite) {
-        int resultCode = SQuery(_db, "read/write transaction", query, 2000 * STIME_US_PER_MS, true);
+        resultCode = SQuery(_db, "read/write transaction", query, 2000 * STIME_US_PER_MS, true);
         if (resultCode == SQLITE_AUTH) {
             // Run re-written query.
             _currentlyRunningRewritten = true;
             SASSERT(SEndsWith(_rewrittenQuery, ";"));
-            result = !SQuery(_db, "read/write transaction", _rewrittenQuery);
+            resultCode = SQuery(_db, "read/write transaction", _rewrittenQuery);
             usedRewrittenQuery = true;
             _currentlyRunningRewritten = false;
-        } else {
-            result = !resultCode;
         }
     } else {
-        result = !SQuery(_db, "read/write transaction", query);
+        resultCode = SQuery(_db, "read/write transaction", query);
     }
-    _checkTiming("timeout in SQLite::write"s);
+
+    // If we got a constraints error, throw that.
+    if (resultCode == SQLITE_CONSTRAINT) {
+        throw constraint_error();
+    }
+
+    _checkInterruptErrors("SQLite::write"s);
     _writeElapsed += STimeNow() - before;
-    if (!result) {
+    if (resultCode) {
         return false;
     }
 
@@ -646,15 +630,19 @@ bool SQLite::prepare() {
     SASSERT(_insideTransaction);
 
     // We lock this here, so that we can guarantee the order in which commits show up in the database.
-    g_commitLock.lock();
-    _mutexLocked = true;
+    if (!_mutexLocked) {
+        _sharedData.commitLock.lock();
+        _sharedData._commitLockTimer.start("SHARED");
+        _mutexLocked = true;
+    }
 
-    // Now that we've locked anybody else from committing, look up the state of the database.
+    // Now that we've locked anybody else from committing, look up the state of the database. We don't need to lock the
+    // SharedData object to get these values as we know it can't currently change.
     string committedQuery, committedHash;
-    uint64_t commitCount = _sharedData->_commitCount.load();
+    uint64_t commitCount = _sharedData.commitCount;
 
     // Queue up the journal entry
-    string lastCommittedHash = getCommittedHash();
+    string lastCommittedHash = getCommittedHash(); // This is why we need the lock.
     _uncommittedHash = SToHex(SHashSHA1(lastCommittedHash + _uncommittedQuery));
     uint64_t before = STimeNow();
 
@@ -662,7 +650,7 @@ bool SQLite::prepare() {
     string query = "INSERT INTO " + _journalName + " VALUES (" + SQ(commitCount + 1) + ", " + SQ(_uncommittedQuery) + ", " + SQ(_uncommittedHash) + " )";
 
     // These are the values we're currently operating on, until we either commit or rollback.
-    _sharedData->_inFlightTransactions[commitCount + 1] = make_pair(_uncommittedQuery, _uncommittedHash);
+    _sharedData.prepareTransactionInfo(commitCount + 1, _uncommittedQuery, _uncommittedHash, _dbCountAtStart);
 
     int result = SQuery(_db, "updating journal", query);
     _prepareElapsed += STimeNow() - before;
@@ -680,7 +668,12 @@ bool SQLite::prepare() {
     return true;
 }
 
-int SQLite::commit() {
+int SQLite::commit(const string& description) {
+    // If commits have been disabled, return an error without attempting the commit.
+    if (!_sharedData._commitEnabled) {
+        return COMMIT_DISABLED;
+    }
+
     SASSERT(_insideTransaction);
     SASSERT(!_uncommittedHash.empty()); // Must prepare first
     int result = 0;
@@ -716,79 +709,92 @@ int SQLite::commit() {
 
     uint64_t before = STimeNow();
     uint64_t beforeCommit = STimeNow();
-    result = SQuery(_db, "committing db transaction", "COMMIT");
-    SINFO("SQuery 'COMMIT' took " << ((STimeNow() - beforeCommit)/1000) << "ms.");
-
-    // And record pages after the commit.
-    int endPages;
-    sqlite3_db_status(_db, SQLITE_DBSTATUS_CACHE_WRITE, &endPages, &dummy, 0);
-
-    // Similarly, record WAL file size.
-    sqlite3_file *pWal = 0;
-    sqlite3_int64 sz;
-    sqlite3_file_control(_db, "main", SQLITE_FCNTL_JOURNAL_POINTER, &pWal);
-    pWal->pMethods->xFileSize(pWal, &sz);
-
-    // And log both these statistics.
-    SINFO("COMMIT operation wrote " << (endPages - startPages) << " pages. WAL file size is " << sz << " bytes.");
+    if (_pageLoggingEnabled) {
+        {
+            lock_guard<mutex> lock(_pageLogMutex);
+            _currentTransactionAttemptCount = _transactionAttemptCount.fetch_add(1);
+            result = SQuery(_db, "committing db transaction", "COMMIT");
+        }
+    } else {
+        result = SQuery(_db, "committing db transaction", "COMMIT");
+    }
 
     // If there were conflicting commits, will return SQLITE_BUSY_SNAPSHOT
     SASSERT(result == SQLITE_OK || result == SQLITE_BUSY_SNAPSHOT);
     if (result == SQLITE_OK) {
+        char time[16];
+        snprintf(time, 16, "%.2fms", (double)(STimeNow() - beforeCommit) / 1000.0);
+
+        // And record pages after the commit.
+        int endPages;
+        sqlite3_db_status(_db, SQLITE_DBSTATUS_CACHE_WRITE, &endPages, &dummy, 0);
+
+        // Similarly, record WAL file size.
+        sqlite3_file *pWal = 0;
+        sqlite3_int64 sz;
+        sqlite3_file_control(_db, "main", SQLITE_FCNTL_JOURNAL_POINTER, &pWal);
+        pWal->pMethods->xFileSize(pWal, &sz);
+
+        if (_currentTransactionAttemptCount != -1) {
+            const char* report = sqlite3_begin_concurrent_report(_db);
+            string logLine = SWHEREAMI + "[row-level-locking] transaction attempt:" +
+                             to_string(_currentTransactionAttemptCount) + " committed. report: " +
+                             (report ? string(report) : "null"s);
+            syslog(LOG_DEBUG, "%s", logLine.c_str());
+        }
         _commitElapsed += STimeNow() - before;
         _journalSize = newJournalSize;
-        _sharedData->_commitCount++;
-        _sharedData->_committedTransactionIDs.insert(_sharedData->_commitCount.load());
-        _sharedData->_lastCommittedHash.store(_uncommittedHash);
-        SDEBUG("Commit successful (" << _sharedData->_commitCount.load() << "), releasing commitLock.");
+        _sharedData.incrementCommit(_uncommittedHash);
         _insideTransaction = false;
         _uncommittedHash.clear();
         _uncommittedQuery.clear();
+        _sharedData._commitLockTimer.stop();
+        _sharedData.commitLock.unlock();
         _mutexLocked = false;
-        {
-            unique_lock<mutex> lock(_sharedData->notifyWaitMutex);
-            _sharedData->currentTransactionCount--;
-        }
-        _sharedData->blockNewTransactionsCV.notify_one();
-        g_commitLock.unlock();
         _queryCache.clear();
-        if (_useCache) {
-            SINFO("Transaction commit with " << _queryCount << " queries attempted, " << _cacheHits << " served from cache for '" << _transactionName << "'.");
+
+        // Notify the checkpoint thread (if there is one) that it might be able to run now.
+        {
+            unique_lock<mutex> lock(_sharedData.notifyWaitMutex);
+            _sharedData.currentTransactionCount--;
         }
-        _useCache = false;
+        _sharedData.blockNewTransactionsCV.notify_one();
+
+        // See if we can checkpoint without holding the commit lock.
+        if (!_sharedData._checkpointThreadBusy) {
+            int walSizeFrames = 0;
+            int framesCheckpointed = 0;
+            uint64_t start = STimeNow();
+            int result = sqlite3_wal_checkpoint_v2(_db, 0, SQLITE_CHECKPOINT_PASSIVE, &walSizeFrames, &framesCheckpointed);
+            SINFO("[checkpoint] passive checkpoint complete with " << _sharedData._currentPageCount
+                  << " pages in WAL file. Result: " << result << ". Total frames checkpointed: "
+                  << framesCheckpointed << " of " << walSizeFrames << " in " << ((STimeNow() - start) / 1000) << "ms.");
+        }
+        SINFO(description << " COMMIT complete in " << time << ". Wrote " << (endPages - startPages)
+              << " pages. WAL file size is " << sz << " bytes. " << _queryCount << " queries attempted, " << _cacheHits
+              << " served from cache.");
         _queryCount = 0;
         _cacheHits = 0;
+        _dbCountAtStart = 0;
     } else {
-        SINFO("Commit failed, waiting for rollback.");
+        if (_currentTransactionAttemptCount != -1) {
+            string logLine = SWHEREAMI  + "[row-level-locking] transaction attempt:" +
+                             to_string(_currentTransactionAttemptCount) + " conflict, will roll back.";
+            syslog(LOG_DEBUG, "%s", logLine.c_str());
+            SINFO("Commit failed, waiting for rollback.");
+        }
     }
+
+    // Reset this to the default on any completion of the transaction, successful or not.
+    _enableCheckpointInterrupt = true;
 
     // if we got SQLITE_BUSY_SNAPSHOT, then we're *still* holding commitLock, and it will need to be unlocked by
     // calling rollback().
     return result;
 }
 
-map<uint64_t, pair<string,string>> SQLite::getCommittedTransactions() {
-    SQLITE_COMMIT_AUTOLOCK;
-
-    // Maps a committed transaction ID to the correct query and hash for that transaction.
-    map<uint64_t, pair<string,string>> result;
-
-    // If nothing's been committed, nothing to return.
-    if (_sharedData->_committedTransactionIDs.empty()) {
-        return result;
-    }
-
-    // For each transaction that we've committed, we'll remove the that transaction from the "in flight" list, and
-    // return that to the caller. This lets SQLiteNode get a list of transactions that have been committed since the
-    // last time it called this function, so that it can replicate them to peers.
-    for (uint64_t key : _sharedData->_committedTransactionIDs) {
-        result[key] = move(_sharedData->_inFlightTransactions.at(key));
-        _sharedData->_inFlightTransactions.erase(key);
-    }
-
-    // There are no longer any outstanding transactions, so we can clear this.
-    _sharedData->_committedTransactionIDs.clear();
-    return result;
+map<uint64_t, tuple<string, string, uint64_t>> SQLite::popCommittedTransactions() {
+    return _sharedData.popCommittedTransactions();
 }
 
 void SQLite::rollback() {
@@ -807,6 +813,14 @@ void SQLite::rollback() {
             _rollbackElapsed += STimeNow() - before;
         }
 
+        if (_currentTransactionAttemptCount != -1) {
+            const char* report = sqlite3_begin_concurrent_report(_db);
+            string logLine = SWHEREAMI + "[row-level-locking] transaction attempt:" +
+                             to_string(_currentTransactionAttemptCount) + " rolled back. report: " +
+                             (report ? string(report) : "null"s);
+            syslog(LOG_DEBUG, "%s", logLine.c_str());
+        }
+
         // Finally done with this.
         _insideTransaction = false;
         _uncommittedHash.clear();
@@ -819,23 +833,25 @@ void SQLite::rollback() {
         // ever having called `prepare`, which would have locked our mutex.
         if (_mutexLocked) {
             _mutexLocked = false;
-            g_commitLock.unlock();
+            _sharedData._commitLockTimer.stop();
+            _sharedData.commitLock.unlock();
         }
         {
-            unique_lock<mutex> lock(_sharedData->notifyWaitMutex);
-            _sharedData->currentTransactionCount--;
+            unique_lock<mutex> lock(_sharedData.notifyWaitMutex);
+            _sharedData.currentTransactionCount--;
         }
-        _sharedData->blockNewTransactionsCV.notify_one();
+        _sharedData.blockNewTransactionsCV.notify_one();
     } else {
         SINFO("Rolling back but not inside transaction, ignoring.");
     }
     _queryCache.clear();
-    if (_useCache) {
-        SINFO("Transaction rollback with " << _queryCount << " queries attempted, " << _cacheHits << " served from cache for '" << _transactionName << "'.");
-    }
-    _useCache = false;
+    SINFO("Transaction rollback with " << _queryCount << " queries attempted, " << _cacheHits << " served from cache.");
     _queryCount = 0;
     _cacheHits = 0;
+    _dbCountAtStart = 0;
+
+    // Reset this to the default on any completion of the transaction, successful or not.
+    _enableCheckpointInterrupt = true;
 }
 
 uint64_t SQLite::getLastTransactionTiming(uint64_t& begin, uint64_t& read, uint64_t& write, uint64_t& prepare,
@@ -851,12 +867,16 @@ uint64_t SQLite::getLastTransactionTiming(uint64_t& begin, uint64_t& read, uint6
 }
 
 bool SQLite::getCommit(uint64_t id, string& query, string& hash) {
+    return getCommit(_db, _journalNames, id, query, hash);
+}
+
+bool SQLite::getCommit(sqlite3* db, const vector<string> journalNames, uint64_t id, string& query, string& hash) {
     // TODO: This can fail if called after `BEGIN TRANSACTION`, if the id we want to look up was committed by another
     // thread. We may or may never need to handle this case.
     // Look up the query and hash for the given commit
-    string q= _getJournalQuery({"SELECT query, hash FROM", "WHERE id = " + SQ(id)});
+    string internalQuery = _getJournalQuery(journalNames, {"SELECT query, hash FROM", "WHERE id = " + SQ(id)});
     SQResult result;
-    SASSERT(!SQuery(_db, "getting commit", q, result));
+    SASSERT(!SQuery(db, "getting commit", internalQuery, result));
     if (!result.empty()) {
         query = result[0][0];
         hash = result[0][1];
@@ -874,7 +894,7 @@ bool SQLite::getCommit(uint64_t id, string& query, string& hash) {
 }
 
 string SQLite::getCommittedHash() {
-    return _sharedData->_lastCommittedHash.load();
+    return _sharedData.lastCommittedHash.load();
 }
 
 bool SQLite::getCommits(uint64_t fromIndex, uint64_t toIndex, SQResult& result) {
@@ -896,18 +916,7 @@ int64_t SQLite::getLastInsertRowID() {
 }
 
 uint64_t SQLite::getCommitCount() {
-    return _sharedData->_commitCount.load();
-}
-
-uint64_t SQLite::_getCommitCount() {
-    string query = _getJournalQuery({"SELECT MAX(id) as maxIDs FROM"}, true);
-    query = "SELECT MAX(maxIDs) FROM (" + query + ")";
-    SQResult result;
-    SASSERT(!SQuery(_db, "getting commit count", query, result));
-    if (result.empty()) {
-        return 0;
-    }
-    return SToUInt64(result[0][0]);
+    return _sharedData.commitCount;
 }
 
 size_t SQLite::getLastWriteChangeCount() {
@@ -1067,8 +1076,84 @@ bool SQLite::getUpdateNoopMode() const {
     return _noopUpdateMode;
 }
 
+uint64_t SQLite::getDBCountAtStart() const {
+    return _dbCountAtStart;
+}
+
+void SQLite::addCheckpointListener(SQLite::CheckpointRequiredListener& listener) {
+    _sharedData.addCheckpointListener(listener);
+}
+
+void SQLite::removeCheckpointListener(SQLite::CheckpointRequiredListener& listener) {
+    _sharedData.removeCheckpointListener(listener);
+}
+
+void SQLite::setCommitEnabled(bool enable) {
+    _sharedData.setCommitEnabled(enable);
+}
+
 SQLite::SharedData::SharedData() :
+nextJournalCount(0),
 currentTransactionCount(0),
 _currentPageCount(0),
-_checkpointThreadBusy(0)
+_checkpointThreadBusy(0),
+_commitEnabled(true),
+_commitLockTimer("commit lock timer", {
+    {"EXCLUSIVE", chrono::steady_clock::duration::zero()},
+    {"SHARED", chrono::steady_clock::duration::zero()},
+})
 { }
+
+void SQLite::SharedData::setCommitEnabled(bool enable) {
+    lock_guard<decltype(commitLock)> lock(commitLock);
+    _commitEnabled = enable;
+}
+
+void SQLite::SharedData::addCheckpointListener(SQLite::CheckpointRequiredListener& listener) {
+    lock_guard<decltype(_internalStateMutex)> lock(_internalStateMutex);
+    _checkpointListeners.insert(&listener);
+}
+
+void SQLite::SharedData::removeCheckpointListener(SQLite::CheckpointRequiredListener& listener) {
+    lock_guard<decltype(_internalStateMutex)> lock(_internalStateMutex);
+    _checkpointListeners.erase(&listener);
+}
+
+void SQLite::SharedData::checkpointRequired(SQLite& db) {
+    lock_guard<decltype(_internalStateMutex)> lock(_internalStateMutex);
+    for (auto listener : _checkpointListeners) {
+        listener->checkpointRequired(db);
+    }
+}
+
+void SQLite::SharedData::checkpointComplete(SQLite& db) {
+    lock_guard<decltype(_internalStateMutex)> lock(_internalStateMutex);
+    for (auto listener : _checkpointListeners) {
+        listener->checkpointComplete(db);
+    }
+}
+
+void SQLite::SharedData::incrementCommit(const string& commitHash) {
+    lock_guard<decltype(_internalStateMutex)> lock(_internalStateMutex);
+    commitCount++;
+    commitTransactionInfo(commitCount);
+    lastCommittedHash.store(commitHash);
+}
+
+void SQLite::SharedData::prepareTransactionInfo(uint64_t commitID, const string& query, const string& hash, uint64_t dbCountAtTransactionStart) {
+    lock_guard<decltype(_internalStateMutex)> lock(_internalStateMutex);
+    _preparedTransactions.insert_or_assign(commitID, make_tuple(query, hash, dbCountAtTransactionStart));
+}
+
+void SQLite::SharedData::commitTransactionInfo(uint64_t commitID) {
+    lock_guard<decltype(_internalStateMutex)> lock(_internalStateMutex);
+    _committedTransactions.insert(_preparedTransactions.extract(commitID));
+}
+
+map<uint64_t, tuple<string, string, uint64_t>> SQLite::SharedData::popCommittedTransactions() {
+    lock_guard<decltype(_internalStateMutex)> lock(_internalStateMutex);
+    decltype(_committedTransactions) result;
+    result = move(_committedTransactions);
+    _committedTransactions.clear();
+    return result;
+}

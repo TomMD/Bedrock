@@ -25,7 +25,7 @@ struct CreateJobTest : tpunit::TestFixture {
 
     BedrockTester* tester;
 
-    void setupClass() { tester = new BedrockTester(_threadID, {{"-plugins", "Jobs,DB"}}, {});}
+    void setupClass() { tester = new BedrockTester({{"-plugins", "Jobs,DB"}}, {});}
 
     // Reset the jobs table
     void tearDown() {
@@ -113,6 +113,7 @@ struct CreateJobTest : tpunit::TestFixture {
         string data = "{\"blabla\":\"blabla\"}";
         command["name"] = jobName;
         command["data"] = data;
+        const string& startTime = SCURRENT_TIMESTAMP();
         STable response = tester->executeWaitVerifyContentTable(command);
         ASSERT_GREATER_THAN(stol(response["jobID"]), 0);
 
@@ -123,8 +124,9 @@ struct CreateJobTest : tpunit::TestFixture {
         ASSERT_EQUAL(originalJob[0][1], response["jobID"]);
         ASSERT_EQUAL(originalJob[0][2], "QUEUED");
         ASSERT_EQUAL(originalJob[0][3], jobName);
-        // nextRun should equal created
-        ASSERT_EQUAL(originalJob[0][4], originalJob[0][0]);
+        // nextRun and created should be equal or higher to the time we started the test
+        ASSERT_TRUE(originalJob[0][0].compare(startTime) >= 0);
+        ASSERT_TRUE(originalJob[0][4].compare(startTime) >= 0);
         ASSERT_EQUAL(originalJob[0][5], "");
         ASSERT_EQUAL(originalJob[0][6], "");
         ASSERT_EQUAL(originalJob[0][7], data);
@@ -197,6 +199,28 @@ struct CreateJobTest : tpunit::TestFixture {
         ASSERT_EQUAL(updatedJob[0][7], data);
         ASSERT_EQUAL(updatedJob[0][8], originalJob[0][8]);
         ASSERT_EQUAL(updatedJob[0][9], originalJob[0][9]);
+
+        // Try to recreate the job with new data, without overwriting the existing data
+        string data2 = "{\"blabla2\":\"test2\"}";
+        command["data"] = data2;
+        command["overwrite"] = "false";
+        response = tester->executeWaitVerifyContentTable(command);
+        ASSERT_EQUAL(stol(response["jobID"]), jobID);
+
+        SQResult nonoverwritenJob;
+        tester->readDB("SELECT created, jobID, state, name, nextRun, lastRun, repeat, data, priority, parentJobID FROM jobs WHERE jobID = " + response["jobID"] + ";", nonoverwritenJob);
+        ASSERT_EQUAL(updatedJob.size(), 1);
+        // Assert that we have not overwritten the job data
+        ASSERT_EQUAL(nonoverwritenJob[0][0], updatedJob[0][0]);
+        ASSERT_EQUAL(nonoverwritenJob[0][1], updatedJob[0][1]);
+        ASSERT_EQUAL(nonoverwritenJob[0][2], updatedJob[0][2]);
+        ASSERT_EQUAL(nonoverwritenJob[0][3], updatedJob[0][3]);
+        ASSERT_EQUAL(nonoverwritenJob[0][4], updatedJob[0][4]);
+        ASSERT_EQUAL(nonoverwritenJob[0][5], updatedJob[0][5]);
+        ASSERT_EQUAL(nonoverwritenJob[0][6], updatedJob[0][6]);
+        ASSERT_EQUAL(nonoverwritenJob[0][7], updatedJob[0][7]);
+        ASSERT_EQUAL(nonoverwritenJob[0][8], updatedJob[0][8]);
+        ASSERT_EQUAL(nonoverwritenJob[0][9], updatedJob[0][9]);
     }
 
     void createWithBadData() {
@@ -302,7 +326,7 @@ struct CreateJobTest : tpunit::TestFixture {
         ASSERT_EQUAL(response["jobID"], jobID);
         ASSERT_EQUAL(response["name"], jobName);
 
-        // Query the db and confirm that state, nextRun and lastRun are 1 second apart because of retryAfter
+        // Query the db and confirm the state, and that nextRun and lastRun are 5 seconds apart because of retryAfter
         SQResult jobData;
         tester->readDB("SELECT state, nextRun, lastRun FROM jobs WHERE jobID = " + jobID + ";", jobData);
         ASSERT_EQUAL(jobData[0][0], "RUNQUEUED");
@@ -325,7 +349,7 @@ struct CreateJobTest : tpunit::TestFixture {
             try {
                 // Let it repeat until it works or we run out of retries.
                 response = tester->executeWaitVerifyContentTable(command);
-                ASSERT_EQUAL(response["data"], "{}");
+                ASSERT_EQUAL(response["data"], "{\"originalNextRun\":\"" + originalJob[0][4] + "\"}");
                 ASSERT_EQUAL(response["jobID"], jobID);
                 ASSERT_EQUAL(response["name"], jobName);
             } catch (...) {
@@ -358,7 +382,7 @@ struct CreateJobTest : tpunit::TestFixture {
         nextRunTime = JobTestHelper::getTimestampForDateTimeString(jobData[0][1]);
         lastRunTime = JobTestHelper::getTimestampForDateTimeString(jobData[0][2]);
         ASSERT_EQUAL(jobData[0][0], "QUEUED");
-        ASSERT_EQUAL(difftime(nextRunTime, lastRunTime), 15);
+        ASSERT_EQUAL(difftime(nextRunTime, lastRunTime), 10);
     }
 
     void retryWithMalformedValue() {

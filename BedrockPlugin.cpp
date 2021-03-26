@@ -2,21 +2,20 @@
 #include "BedrockPlugin.h"
 #include "BedrockServer.h"
 
-list<BedrockPlugin*>* BedrockPlugin::g_registeredPluginList = nullptr;
+map<string, function<BedrockPlugin*(BedrockServer&)>> BedrockPlugin::g_registeredPluginList;
 
-BedrockPlugin::BedrockPlugin() {
-    // Auto-register this instance into the global static list, initializing the list if that hasn't yet been done.
-    // This just makes it available for enabling via the command line: by default all plugins start out disabled.
-    //
-    // NOTE: This code runs *before* main(). This means that libstuff hasn't yet been initialized, so there is no
-    // logging.
-    if (!g_registeredPluginList) {
-        g_registeredPluginList = new list<BedrockPlugin*>;
-    }
-    g_registeredPluginList->push_back(this);
+BedrockPlugin::BedrockPlugin(BedrockServer& s) : server(s) {
 }
 
 BedrockPlugin::~BedrockPlugin() {
+    for (auto httpsManager : httpsManagers) {
+        delete httpsManager;
+    }
+}
+
+bool BedrockPlugin::isValidDate(const string& date)
+{
+    return SREMatch("^(19|2[0-9])\\d\\d-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])( \\d{2}:\\d{2}:\\d{2})?$", date);
 }
 
 void BedrockPlugin::verifyAttributeInt64(const SData& request, const string& name, size_t minSize) {
@@ -47,30 +46,23 @@ void BedrockPlugin::verifyAttributeBool(const SData& request, const string& name
     }
 }
 
-bool BedrockPlugin::shouldEnableQueryRewriting(const SQLite& db, const BedrockCommand& command, bool (**rewriteHandler)(int, const char*, string&)) {
-    return false;
+void BedrockPlugin::verifyAttributeDate(const SData& request, const char* key, bool require)
+{
+    if (require && request[key].empty()) {
+        STHROW("402 Missing " + string(key));
+    }
+
+    if (!request[key].empty() && !isValidDate(request[key])) {
+        STHROW("402 Malformed " + string(key));
+    }
 }
 
 STable BedrockPlugin::getInfo() {
     return STable();
 }
 
-string BedrockPlugin::getName() {
+const string& BedrockPlugin::getName() const {
     SERROR("No name defined by this plugin, aborting.");
-}
-
-void BedrockPlugin::initialize(const SData& args, BedrockServer& server) {}
-
-bool BedrockPlugin::peekCommand(SQLite& db, BedrockCommand& command) {
-    return false;
-}
-
-bool BedrockPlugin::processCommand(SQLite& db, BedrockCommand& command) {
-    return false;
-}
-
-bool BedrockPlugin::shouldSuppressTimeoutWarnings() {
-    return false;
 }
 
 bool BedrockPlugin::preventAttach() {
@@ -80,24 +72,3 @@ bool BedrockPlugin::preventAttach() {
 void BedrockPlugin::timerFired(SStopwatch* timer) {}
 
 void BedrockPlugin::upgradeDatabase(SQLite& db) {}
-
-BedrockPlugin* BedrockPlugin::getPluginByName(const string& name) {
-    // If our global list isn't set, there's no plugin to return.
-    if (!g_registeredPluginList) {
-        return nullptr;
-    }
-
-    // If we find our plugin in our list, we'll return it.
-    for (auto& plugin : *g_registeredPluginList) {
-        if (SIEquals(plugin->getName(), name)) {
-            return plugin;
-        }
-    }
-
-    // Didn't find it.
-    return nullptr;
-}
-
-void BedrockPlugin::handleFailedReply(const BedrockCommand& command) {
-    // Default implementation does nothing.
-}

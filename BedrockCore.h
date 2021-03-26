@@ -7,19 +7,35 @@ class BedrockCore : public SQLiteCore {
   public:
     BedrockCore(SQLite& db, const BedrockServer& server);
 
+    // Possible result values for `peekCommand` and `processCommand`
+    enum class RESULT {
+        INVALID = 0,
+        COMPLETE = 1,
+        SHOULD_PROCESS = 2,
+        NEEDS_COMMIT = 3,
+        NO_COMMIT_REQUIRED = 4,
+        ABANDONED_FOR_CHECKPOINT = 5,
+        SERVER_NOT_LEADING = 6
+    };
+
     // Automatic timing class that records an entry corresponding to its lifespan.
     class AutoTimer {
       public:
-        AutoTimer(BedrockCommand& command, BedrockCommand::TIMING_INFO type) :
+        AutoTimer(unique_ptr<BedrockCommand>& command, BedrockCommand::TIMING_INFO type) :
         _command(command), _type(type), _start(STimeNow()) { }
         ~AutoTimer() {
-            _command.timingInfo.emplace_back(make_tuple(_type, _start, STimeNow()));
+            _command->timingInfo.emplace_back(make_tuple(_type, _start, STimeNow()));
         }
       private:
-        BedrockCommand& _command;
+        unique_ptr<BedrockCommand>& _command;
         BedrockCommand::TIMING_INFO _type;
         uint64_t _start;
     };
+
+    // Checks if a command has already timed out. Like `peekCommand` without doing any work. Returns `true` and sets
+    // the same command state as `peekCommand` would if the command has timed out. Returns `false` and does nothing if
+    // the command hasn't timed out.
+    bool isTimedOut(unique_ptr<BedrockCommand>& command);
 
     // Peek lets you pre-process a command. It will be called on each command before `process` is called on the same
     // command, and it *may be called multiple times*. Preventing duplicate actions on calling peek multiple times is
@@ -28,7 +44,7 @@ class BedrockCore : public SQLiteCore {
     // should be considered an error to modify the DB from inside `peek`.
     // Returns a boolean value of `true` if the command is complete and its `response` field can be returned to the
     // caller. Returns `false` if the command will need to be passed to `process` to complete handling the command.
-    bool peekCommand(BedrockCommand& command);
+    RESULT peekCommand(unique_ptr<BedrockCommand>& command, bool exclusive = false);
 
     // Process is the follow-up to `peek` if `peek` was insufficient to handle the command. It will only ever be called
     // on the leader node, and should always be able to resolve the command completely. When a command is passed to
@@ -40,7 +56,7 @@ class BedrockCore : public SQLiteCore {
     // replicate the transaction to follower nodes. Upon being returned `true`, the caller will attempt to perform a
     // `COMMIT` and replicate the transaction to follower nodes. It's allowable for this `COMMIT` to fail, in which case
     // this command *will be passed to process again in the future to retry*.
-    bool processCommand(BedrockCommand& command);
+    RESULT processCommand(unique_ptr<BedrockCommand>& command, bool exclusive = false);
 
   private:
     // When called in the context of handling an exception, returns the demangled (if possible) name of the exception.
@@ -49,8 +65,8 @@ class BedrockCore : public SQLiteCore {
     // Gets the amount of time remaining until this command times out. This is the difference between the command's
     // 'timeout' value (or the default timeout, if not set) and the time the command was initially scheduled to run. If
     // this time is already expired, this throws `555 Timeout`
-    uint64_t _getRemainingTime(const BedrockCommand& command);
+    uint64_t _getRemainingTime(const unique_ptr<BedrockCommand>& command);
 
-    void _handleCommandException(BedrockCommand& command, const SException& e);
+    void _handleCommandException(unique_ptr<BedrockCommand>& command, const SException& e);
     const BedrockServer& _server;
 };

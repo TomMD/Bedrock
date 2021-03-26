@@ -1,5 +1,7 @@
+#pragma once
 #include <libstuff/libstuff.h>
-#include "../BedrockPlugin.h"
+#include "DB.h"
+#include "BedrockServer.h"
 
 #define MYSQL_NUM_VARIABLES 292
 extern const char* g_MySQLVariables[MYSQL_NUM_VARIABLES][2];
@@ -28,9 +30,10 @@ struct MySQLPacket {
      * Parse a MySQL packet from the wire
      *
      * @param packet Binary data received from the MySQL client
+     * @param size length of packet
      * @return       Number of bytes deserialized, or 0 on failure
      */
-    int deserialize(const string& packet);
+    int deserialize(const char* packet, const size_t size);
 
     /**
      * Creates a MySQL length-encoded integer
@@ -90,19 +93,16 @@ struct MySQLPacket {
 /**
  * Declare the class we're going to implement below
  */
-class BedrockPlugin_MySQL : public BedrockPlugin {
+class BedrockPlugin_MySQL : public BedrockPlugin_DB {
   public:
-    // Indicate which functions we are implementing
-    virtual string getName() { return "MySQL"; }
-    virtual void initialize(const SData& args, BedrockServer& server) { _args = args; }
-    virtual string getPort() {
-        return _args.isSet("-mysql.host") ? _args["-mysql.host"] : "localhost:3306";
-    }
+    BedrockPlugin_MySQL(BedrockServer& s);
+    virtual const string& getName() const;
+    virtual string getPort();
     virtual void onPortAccept(STCPManager::Socket* s);
     virtual void onPortRecv(STCPManager::Socket* s, SData& request);
     virtual void onPortRequestComplete(const BedrockCommand& command, STCPManager::Socket* s);
 
   private:
     // Attributes
-    SData _args;
+    static const string name;
 };

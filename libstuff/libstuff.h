@@ -11,9 +11,11 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h> // for gettimeofday()
 #include <sys/types.h>
+#include <sys/un.h>
 #include <syslog.h>
 #include <stdlib.h>
 #include <time.h>
@@ -25,6 +27,7 @@
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
+#include <iomanip>
 #include <iostream>
 #include <list>
 #include <map>
@@ -77,12 +80,6 @@ void SSetSignalHandlerDieFunc(function<void()>&& func);
                                         << ")");                                                                       \
         }                                                                                                              \
     } while (false)
-#define SASSERTTHROW(condition, uuid)                                                                                  \
-    do {                                                                                                               \
-        if (!(condition)) {                                                                                            \
-            throw AssertionFailedException(#condition, uuid);                                                          \
-        }                                                                                                              \
-    } while (false)
 
 // --------------------------------------------------------------------------
 // A very simple name/value pair table with case-insensitive name matching
@@ -112,6 +109,10 @@ class SString : public string {
         return *this;
     }
 
+    template <typename T>
+    SString(const T& from) : string(from) {}
+    SString() {}
+
     // Templated assignment operator for non-arithmetic types.
     template <typename T>
     typename enable_if<!is_arithmetic<T>::value, SString&>::type operator=(const T& from) {
@@ -139,6 +140,11 @@ class SString : public string {
 };
 
 typedef map<string, SString, STableComp> STable;
+
+// Libstuff items that must be included here so they are available in the rest of the file
+// However it must be included AFTER the STable definition because SData uses this type.
+#include "SFastBuffer.h"
+#include "SData.h"
 
 // An SException is an exception class that can represent an HTTP-like response, with a method line, headers, and a
 // body. The STHROW and STHROW_STACK macros will create an SException that logs it's file and line of creation, and
@@ -169,70 +175,8 @@ class SException : public exception {
     const string body;
 };
 
-// --------------------------------------------------------------------------
-// A very simple HTTP-like structure consisting of a method line, a table,
-// and a content body.
-// --------------------------------------------------------------------------
-struct SData {
-    // Public attributes
-    string methodLine;
-    STable nameValueMap;
-    string content;
-
-    // Constructors
-    SData();
-    SData(const string& method);
-
-    // Allow forwarding emplacements directly so SData can act like `std::map`.
-    template <typename... Ts>
-    pair<decltype(nameValueMap)::iterator, bool> emplace(Ts&&... args) {
-        return nameValueMap.emplace(forward<Ts>(args)...);
-    }
-
-    // Operators
-    string& operator[](const string& name);
-    string operator[](const string& name) const;
-
-    // Two templated versions of `set` are provided. One for arithmetic types, and one for other types (which must be
-    // convertible to 'string'). These allow you to do the following:
-    // SData.set("count", 7);
-    // SData.set("name", "Tyler");
-    // for all string and integer types.
-    template <typename T>
-    typename enable_if<is_arithmetic<T>::value, void>::type set(const string& key, const T item)
-    {
-        nameValueMap[key] = to_string(item);
-    }
-    template <typename T>
-    typename enable_if<!is_arithmetic<T>::value, void>::type set(const string& key, const T item)
-    {
-        nameValueMap[key] = item;
-    }
-
-    // Mutators
-    void clear();
-    void erase(const string& name);
-    void merge(const STable& rhs);
-    void merge(const SData& rhs);
-
-    // Accessors
-    bool empty() const;
-    bool isSet(const string& name) const;
-    int calc(const string& name) const;
-    int64_t calc64(const string& name) const;
-    uint64_t calcU64(const string& name) const;
-    bool test(const string& name) const;
-    string getVerb() const;
-
-    // Serialization
-    void serialize(ostringstream& out) const;
-    string serialize() const;
-    int deserialize(const string& rhs);
-    int deserialize(const char* buffer, int length);
-
-    // Create an SData object; if no Content-Length then take everything as the content
-    static SData create(const string& rhs);
-};
+// Utility function for generating pretty callstacks.
+vector<string> SGetCallstack(int depth = 0, void* const* callstack = nullptr) noexcept;
 
 // --------------------------------------------------------------------------
 // Time stuff TODO: Replace with std::chrono
@@ -250,6 +194,7 @@ uint64_t STimeThisMorning(); // Timestamp for this morning at midnight GMT
 int SDaysInMonth(int year, int month);
 string SComposeTime(const string& format, uint64_t when);
 timeval SToTimeval(uint64_t when);
+string SFirstOfMonth(const string& timeStamp, const int64_t& offset = 0);
 
 // Helpful class for timing
 struct SStopwatch {
@@ -313,7 +258,7 @@ void STerminateHandler(void);
 // Log stuff
 // --------------------------------------------------------------------------
 // Log level management
-extern int _g_SLogMask;
+extern atomic<int> _g_SLogMask;
 inline void SLogLevel(int level) {
     _g_SLogMask = LOG_UPTO(level);
     setlogmask(_g_SLogMask);
@@ -322,46 +267,39 @@ inline void SLogLevel(int level) {
 // Stack trace logging
 void SLogStackTrace();
 
-#define SWHEREAMI                                                                                                      \
-    SThreadLogPrefix + "(" + basename((char*)__FILE__) + ":" + SToStr(__LINE__) + ") " + __FUNCTION__ + " [" + SThreadLogName \
-                   + "] "
+// This is a drop-in replacement for syslog that directly logs to `/run/systemd/journal/syslog` bypassing journald.
+void SSyslogSocketDirect(int priority, const char* format, ...);
 
-// Simply logs a stream to the debugger
-// **NOTE: rsyslog default max line size is 8k bytes.  We split on 7k byte bounderies in order to fit the
-//         syslog line prefix and the expanded \r\n to #015#012
-// **FIXME: Everything submitted to syslog as WARN; doesn't show otherwise
-#define SSYSLOG(_PRI_, _MSG_)                                                                                          \
-    do {                                                                                                               \
-        if (_g_SLogMask & (1 << (_PRI_))) {                                                                            \
-            ostringstream __out;                                                                                       \
-            __out << _MSG_ << endl;                                                                                    \
-            const string& __s = __out.str();                                                                           \
-            for (int __i = 0; __i < (int)__s.size(); __i += 7168)                                                      \
-                syslog(LOG_WARNING, "%s", (SWHEREAMI + __s.substr(__i, 7168).c_str()).c_str());                        \
-        }                                                                                                              \
+// Atomic pointer to the syslog function that we'll actually use. Easy to change to `syslog` or `SSyslogSocketDirect`.
+extern atomic<void (*)(int priority, const char *format, ...)> SSyslogFunc;
+
+// **NOTE: rsyslog default max line size is 8k bytes. We split on 7k byte boundaries in order to fit the syslog line prefix and the expanded \r\n to #015#012
+#define SWHEREAMI SThreadLogPrefix + "(" + basename((char*)__FILE__) + ":" + SToStr(__LINE__) + ") " + __FUNCTION__ + " [" + SThreadLogName + "] "
+#define SSYSLOG(_PRI_, _MSG_)                                                   \
+    do {                                                                        \
+        if (_g_SLogMask & (1 << (_PRI_))) {                                     \
+            ostringstream __out;                                                \
+            __out << _MSG_ << endl;                                             \
+            const string s = __out.str();                                       \
+            const string prefix = SWHEREAMI;                                    \
+            for (size_t i = 0; i < s.size(); i += 7168) {                       \
+                (*SSyslogFunc)(_PRI_, "%s", (prefix + s.substr(i, 7168)).c_str()); \
+            }                                                                   \
+        }                                                                       \
     } while (false)
 
 #define SLOGPREFIX ""
-#define SLOG(_MSG_) SSYSLOG(LOG_DEBUG, SLOGPREFIX << _MSG_)
 #define SDEBUG(_MSG_) SSYSLOG(LOG_DEBUG, "[dbug] " << SLOGPREFIX << _MSG_)
 #define SINFO(_MSG_) SSYSLOG(LOG_INFO, "[info] " << SLOGPREFIX << _MSG_)
-#define SHMMM(_MSG_) SSYSLOG(LOG_WARNING, "[hmmm] " << SLOGPREFIX << _MSG_)
+#define SHMMM(_MSG_) SSYSLOG(LOG_NOTICE, "[hmmm] " << SLOGPREFIX << _MSG_)
 #define SWARN(_MSG_) SSYSLOG(LOG_WARNING, "[warn] " << SLOGPREFIX << _MSG_)
-#define SALERT(_MSG_) SSYSLOG(LOG_WARNING, "[alrt] " << SLOGPREFIX << _MSG_)
-#define SERROR(_MSG_)                                                                                                  \
-    do {                                                                                                               \
-        SSYSLOG(LOG_ERR, "[eror] " << SLOGPREFIX << _MSG_);                                               \
-        SLogStackTrace();                                                                                              \
-        fflush(stdout);                                                                                                \
-        abort();                                                                                                       \
+#define SALERT(_MSG_) SSYSLOG(LOG_ALERT, "[alrt] " << SLOGPREFIX << _MSG_)
+#define SERROR(_MSG_)                                       \
+    do {                                                    \
+        SSYSLOG(LOG_ERR, "[eror] " << SLOGPREFIX << _MSG_); \
+        SLogStackTrace();                                   \
+        abort();                                            \
     } while (false)
-#define STRACE() SLOG("[trac] " << __FILE__ << "(" << __LINE__ << ") :" << __FUNCTION__)
-
-// Convenience class for maintaining connections with a mesh of peers
-#define PDEBUG(_MSG_) SDEBUG("->{" << peer->name << "} " << _MSG_)
-#define PINFO(_MSG_) SINFO("->{" << peer->name << "} " << _MSG_)
-#define PHMMM(_MSG_) SHMMM("->{" << peer->name << "} " << _MSG_)
-#define PWARN(_MSG_) SWARN("->{" << peer->name << "} " << _MSG_)
 
 // --------------------------------------------------------------------------
 // Thread stuff
@@ -380,7 +318,13 @@ struct SAutoThreadPrefix {
     SAutoThreadPrefix(const SData& request) {
         // Retain the old prefix
         oldPrefix = SThreadLogPrefix;
-        SLogSetThreadPrefix(request["requestID"] + (request.isSet("logParam") ? " " + request["logParam"] : "") + " ");
+        const string requestID = request.isSet("requestID") ? request["requestID"] : "xxxxxx";
+        SLogSetThreadPrefix(requestID + (request.isSet("logParam") ? " " + request["logParam"] : "") + " ");
+    }
+    SAutoThreadPrefix(const string& rID) {
+        oldPrefix = SThreadLogPrefix;
+        const string requestID = rID.empty() ? "xxxxxx" : rID;
+        SLogSetThreadPrefix(requestID + " ");
     }
     ~SAutoThreadPrefix() { SLogSetThreadPrefix(oldPrefix); }
 
@@ -402,7 +346,7 @@ namespace std {
     template<>
     struct atomic<string> {
         string operator=(string desired) {
-            SAUTOLOCK(m);
+            lock_guard<decltype(m)> l(m);
             _string = desired;
             return _string;
         }
@@ -410,16 +354,19 @@ namespace std {
             return false;
         }
         void store(string desired, std::memory_order order = std::memory_order_seq_cst) {
-            SAUTOLOCK(m);
+            lock_guard<decltype(m)> l(m);
             _string = desired;
         };
         string load(std::memory_order order = std::memory_order_seq_cst) const {
-            SAUTOLOCK(m);
+            lock_guard<decltype(m)> l(m);
             return _string;
         }
-        operator string() const;
+        operator string() const {
+            lock_guard<decltype(m)> l(m);
+            return _string;
+        }
         string exchange(string desired, std::memory_order order = std::memory_order_seq_cst) {
-            SAUTOLOCK(m);
+            lock_guard<decltype(m)> l(m);
             string existing = _string;
             _string = desired;
             return existing;
@@ -453,7 +400,7 @@ string SHexStringFromBase32(const string& buffer);
 // **NOTE: Use 'ostringstream' because 'stringstream' leaks on VS2005
 template <class T> inline string SToStr(const T& t) {
     ostringstream ss;
-    ss << t;
+    ss << fixed << showpoint << setprecision(6) << t;
     return ss.str();
 }
 
@@ -480,11 +427,13 @@ inline bool SContains(const string& haystack, char needle) { return haystack.fin
 inline bool SContains(const STable& nameValueMap, const string& name) {
     return (nameValueMap.find(name) != nameValueMap.end());
 }
+bool SIsValidSQLiteDateModifier(const string& modifier);
 
 // General testing functions
 inline bool SIEquals(const string& lhs, const string& rhs) { return !strcasecmp(lhs.c_str(), rhs.c_str()); }
 bool SIContains(const string& haystack, const string& needle);
 bool SStartsWith(const string& haystack, const string& needle);
+bool SStartsWith(const char* haystack, size_t haystackSize, const char* needle, size_t needleSize);
 inline bool SEndsWith(const string& haystack, const string& needle) {
     if (needle.size() > haystack.size())
         return false;
@@ -547,16 +496,6 @@ string SReplace(const string& value, const string& find, const string& replace);
 string SReplaceAllBut(const string& value, const string& safeChars, char replaceChar);
 string SReplaceAll(const string& value, const string& unsafeChars, char replaceChar);
 int SStateNameToInt(const char* states[], const string& stateName, unsigned int numStates);
-
-// Stream management
-void SConsumeFront(string& lhs, ssize_t num);
-inline void SConsumeBack(string& lhs, int num) {
-    if ((int)lhs.size() <= num) {
-        lhs.clear();
-    } else {
-        lhs = lhs.substr(0, lhs.size() - num);
-    }
-}
 inline void SAppend(string& lhs, const void* rhs, int num) {
     size_t oldSize = lhs.size();
     lhs.resize(oldSize + num);
@@ -690,13 +629,13 @@ bool SFDAnySet(fd_map& fdm, int socket, short evts);
 int S_socket(const string& host, bool isTCP, bool isPort, bool isBlocking);
 int S_accept(int port, sockaddr_in& fromAddr, bool isBlocking);
 ssize_t S_recvfrom(int s, char* recvBuffer, int recvBufferSize, sockaddr_in& fromAddr);
-bool S_recvappend(int s, string& recvBuffer);
-inline string S_recv(int s) {
-    string buf;
+bool S_recvappend(int s, SFastBuffer& recvBuffer);
+inline SFastBuffer S_recv(int s) {
+    SFastBuffer buf;
     S_recvappend(s, buf);
     return buf;
 }
-bool S_sendconsume(int s, string& sendBuffer);
+bool S_sendconsume(int s, SFastBuffer& sendBuffer);
 int S_poll(fd_map& fdm, uint64_t timeout);
 
 // Network helpers
@@ -782,8 +721,11 @@ bool SQVerifyTable(sqlite3* db, const string& tableName, const string& sql);
 bool SQVerifyTableExists(sqlite3* db, const string& tableName);
 
 // --------------------------------------------------------------------------
-inline string STIMESTAMP(uint64_t when) { return SQ(SComposeTime("%Y-%m-%d %H:%M:%S", when)); }
+inline string SUNQUOTED_TIMESTAMP(uint64_t when) { return SComposeTime("%Y-%m-%d %H:%M:%S", when); }
+inline string STIMESTAMP(uint64_t when) { return SQ(SUNQUOTED_TIMESTAMP(when)); }
+inline string SUNQUOTED_CURRENT_TIMESTAMP() { return SUNQUOTED_TIMESTAMP(STimeNow()); }
 inline string SCURRENT_TIMESTAMP() { return STIMESTAMP(STimeNow()); }
+string SCURRENT_TIMESTAMP_MS();
 
 // --------------------------------------------------------------------------
 // Miscellaneous stuff
@@ -869,7 +811,6 @@ struct STestTimer {
 // Other libstuff headers.
 #include "SRandom.h"
 #include "SPerformanceTimer.h"
-#include "SLockTimer.h"
 #include "SSynchronizedQueue.h"
 
 #endif	// LIBSTUFF_H

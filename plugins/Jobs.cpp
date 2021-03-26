@@ -1,10 +1,37 @@
 #include "Jobs.h"
 #include "../BedrockServer.h"
+#include <sqlitecluster/SQLiteUtils.h>
 
 #undef SLOGPREFIX
 #define SLOGPREFIX "{" << getName() << "} "
 
-#define JOBS_DEFAULT_PRIORITY 500
+const int64_t BedrockPlugin_Jobs::JOBS_DEFAULT_PRIORITY = 500;
+const string BedrockPlugin_Jobs::name("Jobs");
+const string& BedrockPlugin_Jobs::getName() const {
+    return name;
+}
+
+const set<string, STableComp> BedrockPlugin_Jobs::supportedRequestVerbs = {
+    "GetJob",
+    "GetJobs",
+    "QueryJob",
+    "CreateJob",
+    "CreateJobs",
+    "CancelJob",
+    "UpdateJob",
+    "RetryJob",
+    "FinishJob",
+    "FailJob",
+    "DeleteJob",
+    "RequeueJobs",
+};
+
+bool BedrockJobsCommand::canEscalateImmediately(SQLiteCommand& baseCommand) {
+    // This is a set of commands that we will escalate to leader without waiting. It's not intended to be complete but
+    // to solve the biggest issues we have with slow escalation times (i.e., this is usually a problem for `FinishJob`).
+    static const set<string> commands = {"CreateJob", "CreateJobs", "FinishJob"};
+    return commands.count(baseCommand.request.methodLine);
+}
 
 // Disable noop mode for the lifetime of this object.
 class scopedDisableNoopMode {
@@ -25,23 +52,22 @@ class scopedDisableNoopMode {
     bool _wasNoop;
 };
 
-int64_t BedrockPlugin_Jobs::getNextID(SQLite& db)
+BedrockJobsCommand::BedrockJobsCommand(SQLiteCommand&& baseCommand, BedrockPlugin_Jobs* plugin) :
+  BedrockCommand(move(baseCommand), plugin, canEscalateImmediately(baseCommand))
 {
-    int64_t newID = 0;
-    while (!newID) {
-        // Make sure this fits even in a signed int64_t, and is positive.
-        newID = SRandom::rand64();
-        if (newID < 0) {
-            newID = -newID;
-        }
-        newID %= INT64_MAX;
-        string result = db.read( "SELECT jobID FROM jobs WHERE jobID = " + to_string(newID) + ";");
-        if (!result.empty()) {
-            // This one exists! Pick a new one.
-            newID = 0;
-        }
+}
+
+BedrockPlugin_Jobs::BedrockPlugin_Jobs(BedrockServer& s) :
+    BedrockPlugin(s),
+    isLive(server.args.isSet("-live"))
+{
+}
+
+unique_ptr<BedrockCommand> BedrockPlugin_Jobs::getCommand(SQLiteCommand&& baseCommand) {
+    if (supportedRequestVerbs.count(baseCommand.request.getVerb())) {
+        return make_unique<BedrockJobsCommand>(move(baseCommand), this);
     }
-    return newID;
+    return nullptr;
 }
 
 // ==========================================================================
@@ -62,32 +88,24 @@ void BedrockPlugin_Jobs::upgradeDatabase(SQLite& db) {
                                "parentJobID INTEGER NOT NULL DEFAULT 0, "
                                "retryAfter  TEXT NOT NULL DEFAULT \"\")",
                            ignore));
-
-    // These indexes are not used by the Bedrock::Jobs plugin, but provided for easy analysis
-    // using the Bedrock::DB plugin.
-    SASSERT(db.write("CREATE INDEX IF NOT EXISTS jobsName     ON jobs ( name     );"));
-    SASSERT(db.write("CREATE INDEX IF NOT EXISTS jobsParentJobIDState ON jobs ( parentJobID, state ) WHERE parentJobID != 0;"));
-    SASSERT(db.write("CREATE INDEX IF NOT EXISTS jobsStatePriorityNextRunName ON jobs ( state, priority, nextRun, name );"));
+    // verify and conditionally create indexes
+    SASSERT(db.verifyIndex("jobsName", "jobs", "( name )", false, !BedrockPlugin_Jobs::isLive));
+    SASSERT(db.verifyIndex("jobsParentJobIDState", "jobs", "( parentJobID, state ) WHERE parentJobID != 0", false, !BedrockPlugin_Jobs::isLive));
+    SASSERT(db.verifyIndex("jobsStatePriorityNextRunName", "jobs", "( state, priority, nextRun, name )", false, !BedrockPlugin_Jobs::isLive));
 }
 
 // ==========================================================================
-bool BedrockPlugin_Jobs::peekCommand(SQLite& db, BedrockCommand& command) {
-    // Pull out some helpful variables
-    SData& request = command.request;
-    SData& response = command.response;
-    STable& content = command.jsonContent;
+bool BedrockJobsCommand::peek(SQLite& db) {
     const string& requestVerb = request.getVerb();
 
-    // Each command is unique, so if the command causes a crash, we'll identify it on a unique random number.
-    command.request["crashID"] = to_string(SRandom::rand64());
-    command.crashIdentifyingValues.insert("crashID");
+    // Jobs commands can only crash if they look identical.
+    for (const auto& name : request.nameValueMap) {
+        crashIdentifyingValues.insert(name.first);
+    }
 
-    // Reset the content object. It could have been written by a previous call to this function that conflicted in
-    // multi-write.
-    content.clear();
-    response.clear();
+    // We can potentially change this, so we set it here.
+    mockRequest = request.isSet("mockRequest");
 
-    // ----------------------------------------------------------------------
     if (SIEquals(requestVerb, "GetJob") || SIEquals(requestVerb, "GetJobs")) {
         // - GetJob( name )
         // - GetJobs( name, numResults )
@@ -112,7 +130,7 @@ bool BedrockPlugin_Jobs::peekCommand(SQLite& db, BedrockCommand& command) {
         //     - 303 - Timeout
         //     - 404 - No jobs found
         //
-        verifyAttributeSize(request, "name", 1, MAX_SIZE_NAME);
+        BedrockPlugin::verifyAttributeSize(request, "name", 1, BedrockPlugin_Jobs::MAX_SIZE_NAME);
         if (SIEquals(requestVerb, "GetJobs") != request.isSet("numResults")) {
             if (SIEquals(requestVerb, "GetJobs")) {
                 STHROW("402 Missing numResults");
@@ -123,9 +141,7 @@ bool BedrockPlugin_Jobs::peekCommand(SQLite& db, BedrockCommand& command) {
 
         if (request.isSet("jobPriority")) {
             int64_t priority = request.calc64("jobPriority");
-            if (priority != 0 && priority != 500 && priority != 1000) {
-                STHROW("402 Invalid priority value");
-            }
+            _validatePriority(priority);
         }
 
         return false;
@@ -152,7 +168,7 @@ bool BedrockPlugin_Jobs::peekCommand(SQLite& db, BedrockCommand& command) {
         //         . data - JSON data associated with this job
         //     - 404 - No jobs found
         //
-        verifyAttributeInt64(request, "jobID", 1);
+        BedrockPlugin::verifyAttributeInt64(request, "jobID", 1);
 
         // Verify there is a job like this
         SQResult result;
@@ -165,16 +181,16 @@ bool BedrockPlugin_Jobs::peekCommand(SQLite& db, BedrockCommand& command) {
         if (result.empty()) {
             STHROW("404 No job with this jobID");
         }
-        content["created"] = result[0][0];
-        content["jobID"] = result[0][1];
-        content["state"] = result[0][2];
-        content["name"] = result[0][3];
-        content["nextRun"] = result[0][4];
-        content["lastRun"] = result[0][5];
-        content["repeat"] = result[0][6];
-        content["data"] = result[0][7];
-        content["retryAfter"] = result[0][8];
-        content["priority"] = result[0][9];
+        jsonContent["created"] = result[0][0];
+        jsonContent["jobID"] = result[0][1];
+        jsonContent["state"] = result[0][2];
+        jsonContent["name"] = result[0][3];
+        jsonContent["nextRun"] = result[0][4];
+        jsonContent["lastRun"] = result[0][5];
+        jsonContent["repeat"] = result[0][6];
+        jsonContent["data"] = result[0][7];
+        jsonContent["retryAfter"] = result[0][8];
+        jsonContent["priority"] = result[0][9];
         return true; // Successfully processed
     }
 
@@ -182,7 +198,7 @@ bool BedrockPlugin_Jobs::peekCommand(SQLite& db, BedrockCommand& command) {
     else if (SIEquals(requestVerb, "CreateJob") || SIEquals(requestVerb, "CreateJobs")) {
         list<STable> jsonJobs;
         if (SIEquals(requestVerb, "CreateJob")) {
-            verifyAttributeSize(request, "name", 1, MAX_SIZE_SMALL);
+            BedrockPlugin::verifyAttributeSize(request, "name", 1, BedrockPlugin_Jobs::MAX_SIZE_SMALL);
             jsonJobs.push_back(request.nameValueMap);
         } else {
             list<string> multipleJobs;
@@ -208,7 +224,7 @@ bool BedrockPlugin_Jobs::peekCommand(SQLite& db, BedrockCommand& command) {
 
         for (auto& job : jsonJobs) {
             // If no priority set, set it
-            int64_t priority = SContains(job, "jobPriority") ? SToInt(job["jobPriority"]) : JOBS_DEFAULT_PRIORITY;
+            int64_t priority = SContains(job, "jobPriority") ? SToInt(job["jobPriority"]) : BedrockPlugin_Jobs::JOBS_DEFAULT_PRIORITY;
 
             // We'd initially intended for any value to be allowable here, but for
             // performance reasons, we currently will only allow specific values to
@@ -216,9 +232,7 @@ bool BedrockPlugin_Jobs::peekCommand(SQLite& db, BedrockCommand& command) {
             // here so that the caller can know that he did something wrong rather
             // than having his job sit unprocessed in the queue forever. Hopefully
             // we can remove this restriction in the future.
-            if (priority != 0 && priority != 500 && priority != 1000) {
-                STHROW("402 Invalid priority value");
-            }
+            _validatePriority(priority);
 
             // Throw if data is not a valid JSON object, otherwise UPDATE query will fail.
             if (SContains(job, "data") && SParseJSONObject(job["data"]).empty() && job["data"] != "{}") {
@@ -226,7 +240,7 @@ bool BedrockPlugin_Jobs::peekCommand(SQLite& db, BedrockCommand& command) {
             }
 
             // Validate retryAfter
-            if (SContains(job, "retryAfter") && job["retryAfter"] != "" && !_isValidSQLiteDateModifier(job["retryAfter"])){
+            if (SContains(job, "retryAfter") && job["retryAfter"] != "" && !SIsValidSQLiteDateModifier(job["retryAfter"])){
                 STHROW("402 Malformed retryAfter");
             }
 
@@ -253,13 +267,13 @@ bool BedrockPlugin_Jobs::peekCommand(SQLite& db, BedrockCommand& command) {
                 // everything should be good when we get to `processCommand`.
                 STable parentData = SParseJSONObject(result[0][1]);
                 bool parentIsMocked = parentData.find("mockRequest") != parentData.end();
-                bool childIsMocked = command.request.isSet("mockRequest");
+                bool childIsMocked = request.isSet("mockRequest");
 
                 if (parentIsMocked && !childIsMocked) {
-                    command.request["mockRequest"] = "true";
+                    mockRequest = true;
                     SINFO("Setting child job to mocked to match parent.");
                 } else if (!parentIsMocked && childIsMocked) {
-                    command.request.erase("mockRequest");
+                    mockRequest = false;
                     SINFO("Setting child job to non-mocked to match parent.");
                 }
             }
@@ -268,8 +282,8 @@ bool BedrockPlugin_Jobs::peekCommand(SQLite& db, BedrockCommand& command) {
             if (SIEquals(requestVerb, "CreateJob") && SContains(job, "unique") && job["unique"] == "true") {
                 SQResult result;
                 SINFO("Unique flag was passed, checking existing job with name " << job["name"] << ", mocked? "
-                      << (command.request.isSet("mockRequest") ? "true" : "false"));
-                string operation = command.request.isSet("mockRequest") ? "IS NOT" : "IS";
+                      << (mockRequest ? "true" : "false"));
+                string operation = mockRequest ? "IS NOT" : "IS";
                 if (!db.read("SELECT jobID, data "
                              "FROM jobs "
                              "WHERE name=" + SQ(job["name"]) +
@@ -282,8 +296,8 @@ bool BedrockPlugin_Jobs::peekCommand(SQLite& db, BedrockCommand& command) {
                 if (!result.empty() && ((job["data"].empty() && result[0][1] == "{}") || (!job["data"].empty() && result[0][1] == job["data"]))) {
                     // Return early, no need to pass to leader, there are no more jobs to create.
                     SINFO("Job already existed and unique flag was passed, reusing existing job " << result[0][0] << ", mocked? "
-                      << (command.request.isSet("mockRequest") ? "true" : "false"));
-                    content["jobID"] = result[0][0];
+                      << (mockRequest ? "true" : "false"));
+                    jsonContent["jobID"] = result[0][0];
                     return true;
                 }
             }
@@ -304,7 +318,7 @@ bool BedrockPlugin_Jobs::peekCommand(SQLite& db, BedrockCommand& command) {
         //     - 200 - OK
         //     - 402 - Cannot cancel jobs that are running
         //
-        verifyAttributeInt64(request, "jobID", 1);
+        BedrockPlugin::verifyAttributeInt64(request, "jobID", 1);
         int64_t jobID = request.calc64("jobID");
 
         SQResult result;
@@ -350,22 +364,13 @@ bool BedrockPlugin_Jobs::peekCommand(SQLite& db, BedrockCommand& command) {
 }
 
 // ==========================================================================
-bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
+void BedrockJobsCommand::process(SQLite& db) {
     // Disable noop update mode for jobs.
     scopedDisableNoopMode disable(db);
 
     // Pull out some helpful variables
-    SData& request = command.request;
-    SData& response = command.response;
-    STable& content = command.jsonContent;
     const string& requestVerb = request.getVerb();
 
-    // Reset the content object. It could have been written by a previous call to this function that conflicted in
-    // multi-write.
-    content.clear();
-    response.clear();
-
-    // ----------------------------------------------------------------------
     if (SIEquals(requestVerb, "CreateJob") || SIEquals(requestVerb, "CreateJobs")) {
         // - CreateJob( name, [data], [firstRun], [repeat], [jobPriority], [unique], [parentJobID], [retryAfter] )
         //
@@ -379,6 +384,8 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
         //     - jobPriority - High priorities go first (optional, default 500)
         //     - unique - if true, it will check that no other job with this name already exists, if it does it will
         //                return that jobID
+        //     - overwrite - Only applicable when unique is is true. When set to true it will overwrite the existing job
+        //                   with the new jobs data
         //     - parentJobID - The ID of the parent job (optional)
         //     - retryAfter - Amount of auto-retries before marking job as failed (optional)
         //
@@ -398,6 +405,8 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
         //          - jobPriority - High priorities go first (optional, default 500)
         //          - unique - if true, it will check that no other job with this name already exists, if it does it will
         //                     return that jobID
+        //          - overwrite - Only applicable when unique is is true. When set to true it will overwrite the existing job
+        //                        with the new jobs data
         //          - parentJobID - The ID of the parent job (optional)
         //          - retryAfter - Amount of auto-retries before marking job as failed (optional)
         //
@@ -432,7 +441,7 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
 
             // If this is a mock request, we insert that into the data.
             string originalData = job["data"];
-            if (command.request.isSet("mockRequest")) {
+            if (mockRequest) {
                 // Mocked jobs should never repeat.
                 job.erase("repeat");
 
@@ -449,8 +458,8 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
             if (SContains(job, "unique") && job["unique"] == "true") {
                 SQResult result;
                 SINFO("Unique flag was passed, checking existing job with name " << job["name"] << ", mocked? "
-                      << (command.request.isSet("mockRequest") ? "true" : "false"));
-                string operation = command.request.isSet("mockRequest") ? "IS NOT" : "IS";
+                      << (mockRequest ? "true" : "false"));
+                string operation = mockRequest ? "IS NOT" : "IS";
                 if (!db.read("SELECT jobID, data "
                              "FROM jobs "
                              "WHERE name=" + SQ(job["name"]) +
@@ -462,12 +471,12 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
                 // If we got a result, and it's data is the same as passed, we won't change anything.
                 if (!result.empty() && ((job["data"].empty() && result[0][1] == "{}") || (!job["data"].empty() && result[0][1] == job["data"]))) {
                     SINFO("Job already existed with matching data, and unique flag was passed, reusing existing job "
-                          << result[0][0] << ", mocked? " << (command.request.isSet("mockRequest") ? "true" : "false"));
+                          << result[0][0] << ", mocked? " << (mockRequest ? "true" : "false"));
 
                     // If we are calling CreateJob, return early, there are no more jobs to create.
                     if (SIEquals(requestVerb, "CreateJob")) {
-                        content["jobID"] = result[0][0];
-                        return true;
+                        jsonContent["jobID"] = result[0][0];
+                        return;
                     }
 
                     // Append new jobID to list of created jobs.
@@ -508,17 +517,10 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
             }
 
             // If no priority set, set it
-            int64_t priority = SContains(job, "jobPriority") ? SToInt(job["jobPriority"]) : (SContains(job, "priority") ? SToInt(job["priority"]) : JOBS_DEFAULT_PRIORITY);
+            int64_t priority = SContains(job, "jobPriority") ? SToInt(job["jobPriority"]) : (SContains(job, "priority") ? SToInt(job["priority"]) : BedrockPlugin_Jobs::JOBS_DEFAULT_PRIORITY);
 
-            // We'd initially intended for any value to be allowable here, but for
-            // performance reasons, we currently will only allow specific values to
-            // try and keep queries fast. If you pass an invalid value, we'll throw
-            // here so that the caller can know that he did something wrong rather
-            // than having his job sit unprocessed in the queue forever. Hopefully
-            // we can remove this restriction in the future.
-            if (priority != 0 && priority != 500 && priority != 1000) {
-                STHROW("402 Invalid priority value");
-            }
+            // Validate the priority passed in
+            _validatePriority(priority);
 
             // Validate that the parentJobID exists and is in the right state if one was passed.
             int64_t parentJobID = SContains(job, "parentJobID") ? SToInt64(job["parentJobID"]) : 0;
@@ -537,7 +539,7 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
 
                 // Verify that the parent and child job have the same `mockRequest` setting.
                 STable parentData = SParseJSONObject(result[0][2]);
-                if (command.request.isSet("mockRequest") != (parentData.find("mockRequest") != parentData.end())) {
+                if (mockRequest != (parentData.find("mockRequest") != parentData.end())) {
                     STHROW("405 Parent and child jobs must have matching mockRequest setting");
                 }
 
@@ -550,20 +552,22 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
 
             // Are we creating a new job, or updating an existing job?
             if (updateJobID) {
-                // Update the existing job.
-                if(!db.writeIdempotent("UPDATE jobs SET "
-                                         "repeat   = " + SQ(SToUpper(job["repeat"])) + ", " +
-                                         "data     = JSON_PATCH(data, " + safeData + "), " +
-                                         "priority = " + SQ(priority) + " " +
-                                       "WHERE jobID = " + SQ(updateJobID) + ";"))
-                {
-                    STHROW("502 update query failed");
+                if (!SContains(job, "overwrite") || job["overwrite"] == "true" || job["overwrite"] == "") {
+                    // Update the existing job.
+                    if(!db.writeIdempotent("UPDATE jobs SET "
+                                             "repeat   = " + SQ(SToUpper(job["repeat"])) + ", " +
+                                             "data     = JSON_PATCH(data, " + safeData + "), " +
+                                             "priority = " + SQ(priority) + " " +
+                                           "WHERE jobID = " + SQ(updateJobID) + ";"))
+                    {
+                        STHROW("502 update query failed");
+                    }
                 }
 
                 // If we are calling CreateJob, return early, there are no more jobs to create.
                 if (SIEquals(requestVerb, "CreateJob")) {
-                    content["jobID"] = SToStr(updateJobID);
-                    return true;
+                    jsonContent["jobID"] = SToStr(updateJobID);
+                    return;
                 }
 
                 // Append new jobID to list of created jobs.
@@ -586,7 +590,7 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
                 const string& safeRetryAfter = SContains(job, "retryAfter") && !job["retryAfter"].empty() ? SQ(job["retryAfter"]) : SQ("");
 
                 // Create this new job with a new generated ID
-                const int64_t jobIDToUse = getNextID(db);
+                const int64_t jobIDToUse = SQLiteUtils::getRandomID(db, "jobs", "jobID");
                 SINFO("Next jobID to be used " << jobIDToUse);
                 if (!db.writeIdempotent("INSERT INTO jobs ( jobID, created, state, name, nextRun, repeat, data, priority, parentJobID, retryAfter ) "
                          "VALUES( " +
@@ -606,8 +610,8 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
                 }
 
                 if (SIEquals(requestVerb, "CreateJob")) {
-                    content["jobID"] = SToStr(jobIDToUse);
-                    return true;
+                    jsonContent["jobID"] = SToStr(jobIDToUse);
+                    return;
                 }
 
                 // Append new jobID to list of created jobs.
@@ -615,13 +619,13 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
             }
         }
 
-        content["jobIDs"] = SComposeJSONArray(jobIDs);
+        jsonContent["jobIDs"] = SComposeJSONArray(jobIDs);
 
         // Release workers waiting on this state
         // TODO: No "HeldBy" anymore. If a plugin wants to hold a command, it should own it until it's done.
         // node->clearCommandHolds("Jobs:" + request["name"]);
 
-        return true; // Successfully processed
+        return; // Successfully processed
     }
 
     // ----------------------------------------------------------------------
@@ -636,7 +640,7 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
         SQResult result;
         const list<string> nameList = SParseList(request["name"]);
         string safeNumResults = SQ(max(request.calc("numResults"),1));
-        bool mockRequest = command.request.isSet("mockRequest") || command.request.isSet("getMockedJobs");
+        mockRequest = mockRequest || request.isSet("getMockedJobs");
         string selectQuery;
         if (request.isSet("jobPriority")) {
             selectQuery =
@@ -778,16 +782,18 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
         }
 
         if (!retriableJobs.empty()) {
-            SINFO("Updating jobs with retryAfter");
             for (auto job : retriableJobs) {
-                string currentTime = SCURRENT_TIMESTAMP();
-                string retryAfterDateTime = "DATETIME(" + currentTime + ", " + SQ(job["retryAfter"]) + ")";
-                string repeatDateTime = _constructNextRunDATETIME(job["nextRun"], job["lastRun"] != "" ? job["lastRun"] : job["nextRun"], job["repeat"]);
+                SINFO("Updating job with retryAfter " << job["jobID"]);
+                string currentTime = SUNQUOTED_CURRENT_TIMESTAMP();
+                string retryAfterDateTime = "DATETIME(" + SQ(currentTime) + ", " + SQ(job["retryAfter"]) + ")";
+                string repeatDateTime = _constructNextRunDATETIME(job["nextRun"], currentTime, job["repeat"]);
                 string nextRunDateTime = repeatDateTime != "" ? "MIN(" + retryAfterDateTime + ", " + repeatDateTime + ")" : retryAfterDateTime;
+                bool isRepeatBasedOnScheduledTime = SToUpper(job["repeat"]).find("SCHEDULED") != string::npos;
                 string updateQuery = "UPDATE jobs "
                                      "SET state='RUNQUEUED', "
-                                         "lastRun=" + currentTime + ", "
-                                         "nextRun=" + nextRunDateTime + " "
+                                         "lastRun=" + SQ(currentTime) + ", " +
+                                         "nextRun=" + nextRunDateTime + " " +
+                                         (isRepeatBasedOnScheduledTime ? ", data=JSON_SET(data, '$.originalNextRun', " + SQ(job["nextRun"]) + ") ": "") +
                                      "WHERE jobID = " + SQ(job["jobID"]) + ";";
                 if (!db.writeIdempotent(updateQuery)) {
                     STHROW("502 Update failed");
@@ -803,9 +809,9 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
         } else {
             // Multiple responses
             SASSERT(SIEquals(requestVerb, "GetJobs"));
-            content["jobs"] = SComposeJSONArray(jobList);
+            jsonContent["jobs"] = SComposeJSONArray(jobList);
         }
-        return true; // Successfully processed
+        return; // Successfully processed
     }
 
     // ----------------------------------------------------------------------
@@ -818,24 +824,31 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
         //     - jobID - ID of the job to delete
         //     - data  - A JSON object describing work to be done
         //     - repeat - A description of how to repeat (optional)
+        //     - jobPriority - The priority of the job (optional)
+        //     - nextRun - The time to run the job (optional)
         //
-        verifyAttributeInt64(request, "jobID", 1);
-        verifyAttributeSize(request, "data", 1, MAX_SIZE_BLOB);
+        BedrockPlugin::verifyAttributeInt64(request, "jobID", 1);
+        BedrockPlugin::verifyAttributeSize(request, "data", 1, BedrockPlugin_Jobs::MAX_SIZE_BLOB);
 
         // If a repeat is provided, validate it
         if (request.isSet("repeat")) {
             if (request["repeat"].empty()) {
                 SWARN("Repeat is set in UpdateJob, but is set to the empty string. jobID: "
-                      << request["jobID"] << ", removing attribute.");
-                request.erase("repeat");
+                      << request["jobID"] << ".");
             } else if (!_validateRepeat(request["repeat"])) {
                 STHROW("402 Malformed repeat");
             }
         }
 
+        // If a priority is provided, validate it
+        if (request.isSet("jobPriority")) {
+            int64_t priority = request.calc64("jobPriority");
+            _validatePriority(priority);
+        }
+
         // Verify there is a job like this
         SQResult result;
-        if (!db.read("SELECT jobID, nextRun, lastRun "
+        if (!db.read("SELECT jobID, nextRun, lastRun, JSON_EXTRACT(data, '$.mockRequest') "
                      "FROM jobs "
                      "WHERE jobID=" + SQ(request.calc64("jobID")) + ";",
                      result)) {
@@ -847,21 +860,36 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
 
         const string& nextRun = result[0][1];
         const string& lastRun = result[0][2];
+        mockRequest = result[0][3] == "1";
 
-        // Are we rescheduling?
-        const string& newNextRun = request.isSet("repeat") ? _constructNextRunDATETIME(nextRun, lastRun, request["repeat"]) : "";
+        // Preserve the jobs mockRequest attribute so it is not overwritten by data updates.
+        STable newData = SParseJSONObject(request["data"]);
+        if (mockRequest) {
+            newData["mockRequest"] = mockRequest;
+        } else {
+            newData.erase("mockRequest");
+        }
+
+        // Passed next run takes priority over the one computed via the repeat feature
+        string newNextRun;
+        if (request["nextRun"].empty()) {
+            newNextRun = request["repeat"].size() ? _constructNextRunDATETIME(nextRun, lastRun, request["repeat"]) : "";
+        } else {
+            newNextRun = SQ(request["nextRun"]);
+        }
 
         // Update the data
         if (!db.writeIdempotent("UPDATE jobs "
                                 "SET data=" +
-                                SQ(request["data"]) + " " +
-                                (request.isSet("repeat") ? ", repeat=" + SQ(SToUpper(request["repeat"])) : "") +
+                                SQ(SComposeJSONObject(newData)) +
+                                (request["repeat"].size() ? ", repeat=" + SQ(SToUpper(request["repeat"])) : "") +
                                 (!newNextRun.empty() ? ", nextRun=" + newNextRun : "") +
+                                (request.isSet("jobPriority") ? ", priority=" + SQ(request.calc64("jobPriority")) + " " : "") +
                                 "WHERE jobID=" +
                                 SQ(request.calc64("jobID")) + ";")) {
             STHROW("502 Update failed");
         }
-        return true; // Successfully processed
+        return; // Successfully processed
     }
 
     // ----------------------------------------------------------------------
@@ -882,11 +910,12 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
         //     interrupted in a non-fatal way.
         //
         //     Parameters:
-        //     - jobID   - ID of the job to requeue
-        //     - delay   - Number of seconds to wait before retrying
-        //     - nextRun - datetime of next scheduled run
-        //     - name    - An arbitrary string identifier (case insensitive)
-        //     - data    - Data to associate with this job
+        //     - jobID       - ID of the job to requeue
+        //     - delay       - Number of seconds to wait before retrying
+        //     - nextRun     - datetime of next scheduled run
+        //     - name        - An arbitrary string identifier (case insensitive)
+        //     - data        - Data to associate with this job
+        //     - jobPriority - The new priority to set for this job
         //
         // - FinishJob( jobID, [data] )
         //
@@ -897,12 +926,12 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
         //     - jobID  - ID of the job to finish
         //     - data   - Data to associate with this finsihed job
         //
-        verifyAttributeInt64(request, "jobID", 1);
+        BedrockPlugin::verifyAttributeInt64(request, "jobID", 1);
         int64_t jobID = request.calc64("jobID");
 
         // Verify there is a job like this and it's running
         SQResult result;
-        if (!db.read("SELECT state, nextRun, lastRun, repeat, parentJobID, json_extract(data, '$.mockRequest') "
+        if (!db.read("SELECT state, nextRun, lastRun, repeat, parentJobID, json_extract(data, '$.mockRequest'), retryAfter, json_extract(data, '$.originalNextRun') "
                      "FROM jobs "
                      "WHERE jobID=" + SQ(jobID) + ";",
                      result)) {
@@ -917,7 +946,9 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
         const string& lastRun = result[0][2];
         string repeat = result[0][3];
         int64_t parentJobID = SToInt64(result[0][4]);
-        bool mockRequest = result[0][5] == "1";
+        mockRequest = result[0][5] == "1";
+        const string retryAfter = result[0][6];
+        const string originalDataNextRun = result[0][7];
 
         // Make sure we're finishing a job that's actually running
         if (state != "RUNNING" && state != "RUNQUEUED" && !mockRequest) {
@@ -986,21 +1017,41 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
             }
 
             // All done processing this command
-            return true;
+            return;
         }
 
-        // If this is RetryJob and we want to update the name, let's do that
+        // If this is RetryJob and we want to update the name and/or priority, let's do that
         const string& name = request["name"];
-        if (!name.empty() && SIEquals(requestVerb, "RetryJob")) {
-            if (!db.writeIdempotent("UPDATE jobs SET name=" + SQ(name) + " WHERE jobID=" + SQ(jobID) + ";")) {
-                STHROW("502 Failed to update job name");
+        if (SIEquals(requestVerb, "RetryJob")) {
+            list<string> updates;
+            if (!name.empty()) {
+                updates.push_back("name=" + SQ(name) + " ");
+            }
+            if (request.isSet("jobPriority")) {
+                _validatePriority(request.calc64("jobPriority"));
+                updates.push_back("priority=" + SQ(request["jobPriority"]) + " ");
+            }
+            if (!updates.empty()) {
+                bool success = db.writeIdempotent("UPDATE jobs SET " + SComposeList(updates, ", ") + " WHERE jobID=" + SQ(jobID) + ";");
+                if (!success) {
+                    STHROW("502 Failed to update job name/priority");
+                }
             }
         }
 
-        string safeNewNextRun = "";
         // If this is set to repeat, get the nextRun value
+        string safeNewNextRun = "";
         if (!repeat.empty()) {
-            safeNewNextRun = _constructNextRunDATETIME(nextRun, lastRun, repeat);
+            // For all jobs, the last time at which they were scheduled is the currently stored 'nextRun' time
+            string lastScheduled = nextRun;
+
+            // Except for jobs with 'retryAfter' + 'repeat' based on `SCHEDULED`. With 'retryAfter', in GetJob we updated 'nextRun'
+            // to a failure check interval, eg 5 minutes. To account for this here when finishing the job, we use
+            // 'originalNextRun' from the 'data' to get back the originally scheduled time which was 'nextRun' when the job ran.
+            if (!retryAfter.empty() && SToUpper(repeat).find("SCHEDULED") != string::npos) {
+                lastScheduled = originalDataNextRun;
+            }
+            safeNewNextRun = _constructNextRunDATETIME(lastScheduled, lastRun, repeat);
         } else if (SIEquals(requestVerb, "RetryJob")) {
             const string& newNextRun = request["nextRun"];
 
@@ -1063,7 +1114,7 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
         }
 
         // Successfully processed
-        return true;
+        return;
     }
     // ----------------------------------------------------------------------
     else if (SIEquals(request.methodLine, "CancelJob")) {
@@ -1105,7 +1156,7 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
         }
 
         // All done processing this command
-        return true;
+        return;
     }
 
     // ----------------------------------------------------------------------
@@ -1119,7 +1170,7 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
         //     - jobID - ID of the job to fail
         //     - data  - Data to associate with this failed job
         //
-        verifyAttributeInt64(request, "jobID", 1);
+        BedrockPlugin::verifyAttributeInt64(request, "jobID", 1);
 
         // Verify there is a job like this and it's running
         SQResult result;
@@ -1156,7 +1207,7 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
         }
 
         // Successfully processed
-        return true;
+        return;
     }
 
     // ----------------------------------------------------------------------
@@ -1169,7 +1220,7 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
         //     Parameters:
         //     - jobID - ID of the job to delete
         //
-        verifyAttributeInt64(request, "jobID", 1);
+        BedrockPlugin::verifyAttributeInt64(request, "jobID", 1);
 
         // Verify there is a job like this and it's not running
         SQResult result;
@@ -1197,42 +1248,28 @@ bool BedrockPlugin_Jobs::processCommand(SQLite& db, BedrockCommand& command) {
         }
 
         // Successfully processed
-        return true;
+        return;
     }
 
     // Requeue a job for which a getJob(s) command could not complete.
     else if (SIEquals(requestVerb, "RequeueJobs")) {
-        SINFO("Requeueing jobs with IDs: " << command.request["jobIDs"]);
-        list<int64_t> jobIDs = SParseIntegerList(command.request["jobIDs"]);
+        SINFO("Requeueing jobs with IDs: " << request["jobIDs"]);
+        list<int64_t> jobIDs = SParseIntegerList(request["jobIDs"]);
+
         if (jobIDs.size()) {
-            string updateQuery = "UPDATE jobs SET state = 'QUEUED', nextRun = DATETIME("+ SCURRENT_TIMESTAMP() + ") WHERE jobID IN(" + SQList(jobIDs)+ ");";
+            const string& name = request["name"];
+            string nameQuery = name.empty() ? "" : ", name = " + SQ(name) + "";
+            string updateQuery = "UPDATE jobs SET state = 'QUEUED', nextRun = created"+ nameQuery +" WHERE jobID IN(" + SQList(jobIDs)+ ");";
             if (!db.writeIdempotent(updateQuery)) {
                 STHROW("502 RequeueJobs update failed");
             }
-
-            // If we want to update the name, let's do that
-            const string& name = request["name"];
-            if (!name.empty()) {
-                if (!db.writeIdempotent("UPDATE jobs SET name = " + SQ(name) + " WHERE jobID IN(" + SQList(jobIDs)+ ");")) {
-                    STHROW("502 Failed to update job name");
-                }
-            }
         }
 
-        return true;
+        return;
     }
-
-    // Didn't recognize this command
-    return false;
 }
 
-// Under this line we don't know the "node", so remove from the log prefix
-#undef SLOGPREFIX
-#define SLOGPREFIX "{" << getName() << "} "
-
-// ==========================================================================
-string BedrockPlugin_Jobs::_constructNextRunDATETIME(const string& lastScheduled, const string& lastRun,
-                                                     const string& repeat) {
+string BedrockJobsCommand::_constructNextRunDATETIME(const string& lastScheduled, const string& lastRun, const string& repeat) {
     if (repeat.empty()) {
         return "";
     }
@@ -1269,7 +1306,7 @@ string BedrockPlugin_Jobs::_constructNextRunDATETIME(const string& lastScheduled
 
     for (const string& part : parts) {
         // Validate the sqlite date modifiers
-        if (!_isValidSQLiteDateModifier(part)){
+        if (!SIsValidSQLiteDateModifier(part)){
             SWARN("Syntax error, failed parsing repeat "+part);
             return "";
         }
@@ -1283,7 +1320,7 @@ string BedrockPlugin_Jobs::_constructNextRunDATETIME(const string& lastScheduled
 
 // ==========================================================================
 
-bool BedrockPlugin_Jobs::_hasPendingChildJobs(SQLite& db, int64_t jobID) {
+bool BedrockJobsCommand::_hasPendingChildJobs(SQLite& db, int64_t jobID) {
     // Returns true if there are any children of this jobID in a "pending" (eg,
     // running or yet to run) state
     SQResult result;
@@ -1298,41 +1335,28 @@ bool BedrockPlugin_Jobs::_hasPendingChildJobs(SQLite& db, int64_t jobID) {
     return !result.empty();
 }
 
-bool BedrockPlugin_Jobs::_isValidSQLiteDateModifier(const string& modifier) {
-    // See: https://www.sqlite.org/lang_datefunc.html
-    list<string> parts = SParseList(SToUpper(modifier));
-    for (const string& part : parts) {
-        // Simple regexp validation
-        if (SREMatch("^(\\+|-)\\d{1,3} (YEAR|MONTH|DAY|HOUR|MINUTE|SECOND)S?$", part)) {
-            continue;
-        }
-        if (SREMatch("^START OF (DAY|MONTH|YEAR)$", part)) {
-            continue;
-        }
-        if (SREMatch("^WEEKDAY [0-6]$", part)) {
-            continue;
-        }
-
-        // Couldn't match this part to any valid syntax
-        SINFO("Syntax error, failed parsing date modifier '" << modifier << "' on part '" << part << "'");
-        return false;
+void BedrockJobsCommand::_validatePriority(const int64_t priority) {
+    // We'd initially intended for any value to be allowable here, but for
+    // performance reasons, we currently will only allow specific values to
+    // try and keep queries fast. If you pass an invalid value, we'll throw
+    // here so that the caller can know that he did something wrong rather
+    // than having his job sit unprocessed in the queue forever. Hopefully
+    // we can remove this restriction in the future.
+    if (priority != 0 && priority != 500 && priority != 1000) {
+        STHROW("402 Invalid priority value");
     }
-
-    // Matched all parts, valid syntax
-    return true;
 }
 
-void BedrockPlugin_Jobs::handleFailedReply(const BedrockCommand& command) {
-    if (SIEquals(command.request.methodLine, "GetJob") || SIEquals(command.request.methodLine, "GetJobs")) {
-
+void BedrockJobsCommand::handleFailedReply() {
+    if (SIEquals(request.methodLine, "GetJob") || SIEquals(request.methodLine, "GetJobs")) {
         list<string> jobIDs;
-        if (SIEquals(command.request.methodLine, "GetJob")) {
-            STable jobJSON = SParseJSONObject(command.response.content);
+        if (SIEquals(request.methodLine, "GetJob")) {
+            STable jobJSON = SParseJSONObject(response.content);
             if (jobJSON.find("jobID") != jobJSON.end()) {
                 jobIDs.push_back(jobJSON["jobID"]);
             }
         } else {
-            STable jobsJSON = SParseJSONObject(command.response.content);
+            STable jobsJSON = SParseJSONObject(response.content);
             list<string> jobs = SParseJSONArray(jobsJSON["jobs"]);
             for (auto& job : jobs) {
                 STable jobJSON = SParseJSONObject(job);
@@ -1341,22 +1365,14 @@ void BedrockPlugin_Jobs::handleFailedReply(const BedrockCommand& command) {
                 }
             }
         }
-        SINFO("Failed sending response to '" << command.request.methodLine << "', re-queueing jobs: "<< SComposeList(jobIDs));
-        if(_server) {
-            SData requeue("RequeueJobs");
-            requeue["jobIDs"] = SComposeList(jobIDs);
+        SINFO("Failed sending response to '" << request.methodLine << "', re-queueing jobs: "<< SComposeList(jobIDs));
+        SData requeue("RequeueJobs");
+        requeue["jobIDs"] = SComposeList(jobIDs);
 
-            // Keep the request ID so we'll be able to associate these in the logs.
-            requeue["requestID"] = command.request["requestID"];
-            SQLiteCommand cmd(move(requeue));
-            cmd.initiatingClientID = -1;
-            _server->acceptCommand(move(cmd));
-        } else {
-            SWARN("No server, can't re-queue jobs: " << SComposeList(jobIDs));
-        }
+        // Keep the request ID so we'll be able to associate these in the logs.
+        requeue["requestID"] = request["requestID"];
+        auto cmd = make_unique<SQLiteCommand>(move(requeue));
+        cmd->initiatingClientID = -1;
+        _plugin->server.acceptCommand(move(cmd));
     }
-}
-
-void BedrockPlugin_Jobs::initialize(const SData& args, BedrockServer& server) {
-    _server = &server;
 }

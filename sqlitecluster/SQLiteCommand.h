@@ -3,6 +3,10 @@
 
 class SQLiteCommand {
   public:
+
+    // This allows for modifying a request passed into the constructor such that we can store it as `const`.
+    static SData preprocessRequest(SData&& request);
+
     // If this command was created via an escalation from a peer, this value will point to that peer object. As such,
     // this should only ever be set on leader nodes, though it does not *need* to be set on leader nodes, as they can
     // also accept connections directly from clients.
@@ -24,11 +28,8 @@ class SQLiteCommand {
     // need to  respond to them.
     string id;
 
-    // Used inside SQLiteNode
-    SData transaction;
-
-    // Original request
-    SData request;
+    // Original request, immutable.
+    const SData request;
 
     // Accumulated response content
     STable jsonContent;
@@ -52,6 +53,9 @@ class SQLiteCommand {
     // follower to leader.
     uint64_t creationTime;
 
+    // Whether or not the command has been escalated.
+    bool escalated;
+
     // Construct that takes a request object.
     SQLiteCommand(SData&& _request);
 
@@ -65,5 +69,5 @@ class SQLiteCommand {
     SQLiteCommand& operator=(SQLiteCommand&& from) = default;
 
     // Destructor.
-    ~SQLiteCommand() {}
+    virtual ~SQLiteCommand() {}
 };

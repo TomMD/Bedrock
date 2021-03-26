@@ -67,7 +67,7 @@ void SInitializeSignals() {
     _SSignal_threadCaughtSignalNumber = 0;
 
     // Make a set of all signals except certain exceptions. These exceptions will cause an `abort()` and attempt to log
-    // a stack trace before esiting. All other signals will get passed to the signal handling thread.
+    // a stack trace before exiting. All other signals will get passed to the signal handling thread.
     sigset_t signals;
     sigfillset(&signals);
     sigdelset(&signals, SIGSEGV);
@@ -150,7 +150,7 @@ void _SSignal_StackTrace(int signum, siginfo_t *info, void *ucontext) {
             void* callstack[100];
             int depth = backtrace(callstack, 100);
 
-            // Log it to a file.Everything in this block should be signal-safe, if we managed to generate the
+            // Log it to a file. Everything in this block should be signal-safe, if we managed to generate the
             // backtrace in the first place.
             int fd = creat("/tmp/bedrock_crash.log", 0666);
             if (fd != -1) {
@@ -162,9 +162,9 @@ void _SSignal_StackTrace(int signum, siginfo_t *info, void *ucontext) {
             // also might not do what we hope.
             SWARN("Signal " << strsignal(_SSignal_threadCaughtSignalNumber) << "(" << _SSignal_threadCaughtSignalNumber
                   << ") caused crash, logging stack trace.");
-            char** symbols = backtrace_symbols(callstack, depth);
-            for (int c = 0; c < depth; ++c) {
-                SWARN(symbols[c]);
+            vector<string> stack = SGetCallstack(depth, callstack);
+            for (const auto& frame : stack) {
+                SWARN(frame);
             }
 
             // Call our die function and then reset it.

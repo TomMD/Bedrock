@@ -10,8 +10,10 @@
 #include "plugins/DB.h"
 #include "plugins/Jobs.h"
 #include "plugins/MySQL.h"
+#include "sqlitecluster/SQLite.h"
 #include <sys/stat.h> // for umask()
 #include <dlfcn.h>
+#include <sys/resource.h>
 
 /////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////
@@ -80,18 +82,16 @@ set<string> loadPlugins(SData& args) {
     // Those are stored here.
     set <string> postProcessedNames;
 
-    // Instantiate all of our built-in plugins.
-    map<string, BedrockPlugin*> standardPluginMap = {
-        {"DB",     new BedrockPlugin_DB()},
-        {"JOBS",   new BedrockPlugin_Jobs()},
-        {"CACHE",  new BedrockPlugin_Cache()},
-        {"MYSQL",  new BedrockPlugin_MySQL()}
-    };
+    // Register all of our built-in plugins.
+    BedrockPlugin::g_registeredPluginList.emplace(make_pair("DB", [](BedrockServer& s){return new BedrockPlugin_DB(s);}));
+    BedrockPlugin::g_registeredPluginList.emplace(make_pair("JOBS", [](BedrockServer& s){return new BedrockPlugin_Jobs(s);}));
+    BedrockPlugin::g_registeredPluginList.emplace(make_pair("CACHE", [](BedrockServer& s){return new BedrockPlugin_Cache(s);}));
+    BedrockPlugin::g_registeredPluginList.emplace(make_pair("MYSQL", [](BedrockServer& s){return new BedrockPlugin_MySQL(s);}));
 
     for (string pluginName : plugins) {
-        // If it's one of our standard plugins, pass it's name through to postProcessedNames and move on.
-        if (standardPluginMap.find(SToUpper(pluginName)) != standardPluginMap.end()) {
-            postProcessedNames.insert(SToUpper(pluginName));
+        // If it's one of our standard plugins, just move on to the next one.
+        if (BedrockPlugin::g_registeredPluginList.find(SToUpper(pluginName)) != BedrockPlugin::g_registeredPluginList.end()) {
+            postProcessedNames.emplace(SToUpper(pluginName));
             continue;
         }
 
@@ -128,7 +128,7 @@ set<string> loadPlugins(SData& args) {
                 SWARN("Couldn't find symbol " << symbolName);
             } else {
                 // Call the plugin registration function with the same name.
-                ((void(*)()) sym)();
+                BedrockPlugin::g_registeredPluginList.emplace(make_pair(SToUpper(name), (BedrockPlugin*(*)(BedrockServer&))sym));
             }
         }
     }
@@ -145,6 +145,28 @@ int main(int argc, char* argv[]) {
         // -- let's provide some help just in case
         cout << "Protip: check syslog for details, or run 'bedrock -?' for help" << endl;
     }
+
+    // Initialize the sqlite library before any other code has a chance to do anything with it.
+    // Set the logging callback for sqlite errors.
+    SASSERT(sqlite3_config(SQLITE_CONFIG_LOG, SQLite::_sqliteLogCallback, 0) == SQLITE_OK);
+
+    // Enable memory-mapped files.
+    int64_t mmapSizeGB = args.isSet("-mmapSizeGB") ? stoll(args["-mmapSizeGB"]) : 0;
+    if (mmapSizeGB) {
+        SINFO("Enabling Memory-Mapped I/O with " << mmapSizeGB << " GB.");
+        const int64_t GB = 1024 * 1024 * 1024;
+        SASSERT(sqlite3_config(SQLITE_CONFIG_MMAP_SIZE, mmapSizeGB * GB, 16 * 1024 * GB) == SQLITE_OK); // Max is 16TB
+    }
+
+    // Disable a mutex around `malloc`, which is *EXTREMELY IMPORTANT* for multi-threaded performance. Without this
+    // setting, all reads are essentially single-threaded as they'll all fight with each other for this mutex.
+    SASSERT(sqlite3_config(SQLITE_CONFIG_MEMSTATUS, 0) == SQLITE_OK);
+    sqlite3_initialize();
+    SASSERT(sqlite3_threadsafe());
+
+    // Disabled by default, but lets really beat it in. This way checkpointing does not need to wait on locks
+    // created in this thread.
+    SASSERT(sqlite3_enable_shared_cache(0) == SQLITE_OK);
 
     // Fork if requested
     if (args.isSet("-fork")) {
@@ -296,13 +318,25 @@ int main(int argc, char* argv[]) {
         SASSERT(SFileExists(args["-db"]));
     }
 
+    // Set our soft limit to the same as our hard limit to allow for more file handles.
+    struct rlimit limits;
+    if (!getrlimit(RLIMIT_NOFILE, &limits)) {
+        limits.rlim_cur = limits.rlim_max;
+        if (setrlimit(RLIMIT_NOFILE, &limits)) {
+            SERROR("Couldn't set FD limit");
+        }
+    } else {
+        SERROR("Couldn't get FD limit");
+    }
+
     // Log stack traces if we have unhandled exceptions.
     set_terminate(STerminateHandler);
 
     // Create our BedrockServer object so we can keep it for the life of the
     // program.
     SINFO("Starting bedrock server");
-    BedrockServer server(args);
+    BedrockServer* _server = new BedrockServer(args);
+    BedrockServer& server = *_server;
 
     // Keep going until someone kills it (either via TERM or Control^C)
     while (!(SGetSignal(SIGTERM) || SGetSignal(SIGINT))) {
@@ -354,8 +388,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Log how much time we spent in our main mutex.
-    SQLite::g_commitLock.log();
+    SINFO("Deleting BedrockServer");
+    delete _server;
+    SINFO("BedrockServer deleted");
 
     // All done
     SINFO("Graceful process shutdown complete");
